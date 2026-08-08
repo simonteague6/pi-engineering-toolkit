@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-export type LifecycleState = "queued" | "running" | "completed" | "failed";
+export type LifecycleState = "queued" | "running" | "completed" | "failed" | "cancelled" | "suspended";
 
 export interface UsageRecord {
 	provider?: string;
@@ -153,6 +153,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			node.state = "running";
 			await writeSnapshot(runDirectory, snapshot);
 
+			const startedAt = Date.now();
 			let outcome: ChildRunnerResult;
 			try {
 				outcome = await runner.run({
@@ -167,6 +168,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			} catch (error) {
 				outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
 			}
+			outcome = withDuration(outcome, Date.now() - startedAt);
 
 			const artifact: Artifact = {
 				kind: outcome.state === "completed" ? "result" : "failure",
@@ -247,11 +249,16 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function withDuration(outcome: ChildRunnerResult, durationMs: number): ChildRunnerResult {
+	return { ...outcome, usage: { ...outcome.usage, durationMs: Math.max(0, durationMs) } };
+}
+
 /** Default runner: a one-shot Pi JSON subprocess with a fresh, ephemeral session. */
 export class SubprocessJsonRunner implements ChildRunner {
 	constructor(private readonly executable = "pi") {}
 
 	async run(request: ChildRunnerRequest): Promise<ChildRunnerResult> {
+		const startedAt = Date.now();
 		const args = ["--mode", "json", "-p", "--no-session"];
 		if (request.model) args.push("--model", request.model);
 		if (request.tools && request.tools.length > 0) args.push("--tools", request.tools.join(","));
@@ -303,9 +310,13 @@ export class SubprocessJsonRunner implements ChildRunner {
 			child.once("error", reject);
 			child.once("close", (code) => {
 				processLine(stdout);
-				const usage = provider || model || inputTokens !== undefined || outputTokens !== undefined
-					? { provider, model, inputTokens, outputTokens }
-					: undefined;
+				const usage: UsageRecord = {
+					provider,
+					model,
+					inputTokens,
+					outputTokens,
+					durationMs: Math.max(0, Date.now() - startedAt),
+				};
 				if (code !== 0 || stopReason === "error" || stopReason === "aborted") {
 					resolve({
 						state: "failed",

@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createSubagentRuntime,
+	SubprocessJsonRunner,
 	type ChildRunner,
 	type ChildRunnerRequest,
 } from "../subagents/runtime.ts";
@@ -24,6 +25,31 @@ async function withRuntime<T>(
 	} finally {
 		await rm(storeDirectory, { recursive: true, force: true });
 	}
+}
+
+async function withSubprocessRunner<T>(
+	script: string,
+	test: (runner: SubprocessJsonRunner) => Promise<T>,
+): Promise<T> {
+	const directory = await mkdtemp(join(tmpdir(), "pi-subprocess-runner-"));
+	const executable = join(directory, "fake-pi");
+	await writeFile(executable, `#!/usr/bin/env bun\n${script}`, "utf8");
+	await chmod(executable, 0o755);
+	try {
+		return await test(new SubprocessJsonRunner(executable));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
+function childRequest(): ChildRunnerRequest {
+	return {
+		runId: "run_test",
+		nodeId: "node_test",
+		logicalRole: "Recon",
+		task: "Inspect the repository",
+		cwd: process.cwd(),
+	};
 }
 
 describe("subagent runtime", () => {
@@ -51,9 +77,16 @@ describe("subagent runtime", () => {
 			expect(launch.node.result).toEqual({
 				state: "completed",
 				output: "Found the runtime boundary.",
-				usage: { provider: "test", model: "deterministic", inputTokens: 12, outputTokens: 5 },
+				usage: expect.objectContaining({
+					provider: "test",
+					model: "deterministic",
+					inputTokens: 12,
+					outputTokens: 5,
+					durationMs: expect.any(Number),
+				}),
 			});
-			expect(launch.node.usage).toEqual({ provider: "test", model: "deterministic", inputTokens: 12, outputTokens: 5 });
+			expect(launch.node.usage).toMatchObject({ provider: "test", model: "deterministic", inputTokens: 12, outputTokens: 5 });
+			expect(launch.node.usage?.durationMs).toBeGreaterThanOrEqual(0);
 			expect(launch.node.artifacts).toHaveLength(1);
 			expect(launch.node.artifacts[0]!.kind).toBe("result");
 			expect(typeof launch.node.artifacts[0]!.path).toBe("string");
@@ -134,15 +167,106 @@ describe("subagent runtime", () => {
 	});
 
 	test("does not expose completed status until the durable result can be read", async () => {
-		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "saved first" }) };
+		let request: ChildRunnerRequest | undefined;
+		let releaseRunner: (() => void) | undefined;
+		let runnerStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => { runnerStarted = resolve; });
+		const runner: ChildRunner = {
+			run: async (runnerRequest) => {
+				request = runnerRequest;
+				runnerStarted!();
+				await new Promise<void>((resolve) => { releaseRunner = resolve; });
+				return { state: "completed", output: "saved first" };
+			},
+		};
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = await runtime.launch(singleNode());
-			const resultArtifact = launch.node.artifacts.find((artifact) => artifact.kind === "result");
+			const launch = runtime.launch(singleNode());
+			await started;
+			expect((await runtime.status(request!.runId)).run.state).toBe("running");
 
-			expect(launch.node.state).toBe("completed");
-			expect(await readFile(resultArtifact!.path, "utf8")).toContain("saved first");
-			expect(await runtime.result(launch.run.id, launch.node.id)).toMatchObject({ output: "saved first" });
+			releaseRunner!();
+			let terminalStatus = await runtime.status(request!.runId);
+			while (terminalStatus.run.state !== "completed") {
+				await Promise.resolve();
+				terminalStatus = await runtime.status(request!.runId);
+			}
+
+			expect(terminalStatus.nodes[0]!.state).toBe("completed");
+			expect(await runtime.result(request!.runId, request!.nodeId)).toMatchObject({ output: "saved first" });
+			expect((await launch).node.state).toBe("completed");
+		});
+	});
+});
+
+describe("subprocess JSON runner", () => {
+	test("parses settled JSONL output, usage, and duration", async () => {
+		await withSubprocessRunner(`
+			console.log(JSON.stringify({ type: "message_end", message: {
+				role: "assistant", content: [{ type: "text", text: "first" }, { type: "text", text: "second" }],
+				stopReason: "stop", provider: "test-provider", model: "test-model", usage: { input: 12, output: 5 },
+			} }));
+			console.log(JSON.stringify({ type: "agent_settled" }));
+		`, async (runner) => {
+			const result = await runner.run(childRequest());
+
+			expect(result).toEqual({
+				state: "completed",
+				output: "first\nsecond",
+				usage: expect.objectContaining({
+					provider: "test-provider",
+					model: "test-model",
+					inputTokens: 12,
+					outputTokens: 5,
+					durationMs: expect.any(Number),
+				}),
+			});
+		});
+	});
+
+	test("fails when a JSONL event is malformed and preserves stderr", async () => {
+		await withSubprocessRunner(`
+			console.error("protocol failed");
+			console.log("{not valid JSON");
+		`, async (runner) => {
+			const result = await runner.run(childRequest());
+
+			expect(result).toMatchObject({
+				state: "failed",
+				error: { kind: "stream", message: "Pi emitted malformed JSON", stderr: "protocol failed\n" },
+			});
+		});
+	});
+
+	test("requires agent_settled after a final assistant message", async () => {
+		await withSubprocessRunner(`
+			console.log(JSON.stringify({ type: "message_end", message: {
+				role: "assistant", content: [{ type: "text", text: "unsettled" }], stopReason: "stop",
+			} }));
+		`, async (runner) => {
+			const result = await runner.run(childRequest());
+
+			expect(result).toMatchObject({
+				state: "failed",
+				error: { kind: "stream", message: "Pi exited without settled final assistant output", partialOutput: "unsettled" },
+			});
+		});
+	});
+
+	test("returns execution evidence when the child exits unsuccessfully", async () => {
+		await withSubprocessRunner(`
+			console.error("provider failed");
+			console.log(JSON.stringify({ type: "message_end", message: {
+				role: "assistant", content: [{ type: "text", text: "partial" }],
+			} }));
+			process.exit(7);
+		`, async (runner) => {
+			const result = await runner.run(childRequest());
+
+			expect(result).toMatchObject({
+				state: "failed",
+				error: { kind: "execution", message: "Pi exited with code 7", stderr: "provider failed\n", partialOutput: "partial" },
+			});
 		});
 	});
 });
