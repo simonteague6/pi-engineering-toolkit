@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import {
+	defaultDefinitionDirectories,
+	resolveAgentDefinition,
+	type DefinitionDirectories,
+	type ReasoningLevel,
+} from "./definitions.ts";
 
 export type LifecycleState = "queued" | "running" | "completed" | "failed" | "cancelled" | "suspended";
 
@@ -27,10 +33,14 @@ export interface FailureEvidence {
 }
 
 export interface NodeDefinition {
+	agent: string;
 	logicalRole: string;
 	task: string;
 	cwd?: string;
+	provider?: string;
 	model?: string;
+	reasoning?: ReasoningLevel;
+	/** Additional named tools for this node only. */
 	tools?: readonly string[];
 }
 
@@ -42,11 +52,18 @@ export interface SingleNodeGraph {
 export interface ChildRunnerRequest {
 	runId: string;
 	nodeId: string;
+	agent: string;
 	logicalRole: string;
 	task: string;
 	cwd: string;
-	model?: string;
-	tools?: readonly string[];
+	provider: string;
+	model: string;
+	reasoning: ReasoningLevel;
+	tools: readonly string[];
+	systemPrompt: string;
+	freshResources: true;
+	recursiveDelegation: false;
+	approvalPrompts: false;
 }
 
 export type ChildRunnerResult =
@@ -58,17 +75,33 @@ export interface ChildRunner {
 	run(request: ChildRunnerRequest): Promise<ChildRunnerResult>;
 }
 
+export interface ExecutionPolicy {
+	agent: string;
+	provider: string;
+	model: string;
+	reasoning: ReasoningLevel;
+	tools: readonly string[];
+	cwd: string;
+	runnerMode: "subprocess-json";
+	freshResources: true;
+	recursiveDelegation: false;
+	approvalPrompts: false;
+}
+
 export interface NodeResult {
 	state: "completed" | "failed";
 	output?: string;
 	error?: FailureEvidence;
 	usage?: UsageRecord;
+	policy: ExecutionPolicy;
 }
 
 export interface NodeView {
 	id: string;
+	agent: string;
 	logicalRole: string;
 	state: LifecycleState;
+	policy: ExecutionPolicy;
 	artifacts: Artifact[];
 	usage?: UsageRecord;
 	result?: NodeResult;
@@ -89,9 +122,17 @@ export interface StatusView {
 	nodes: Array<Omit<NodeView, "result">>;
 }
 
+export interface ModelCatalog {
+	isAvailable(provider: string, model: string): boolean | Promise<boolean>;
+}
+
 export interface SubagentRuntimeOptions {
 	storeDirectory: string;
 	runner?: ChildRunner;
+	/** The parent working directory used when a graph node omits cwd. */
+	cwd?: string;
+	definitionDirectories?: Partial<DefinitionDirectories>;
+	modelCatalog: ModelCatalog;
 }
 
 /** Stable public operations; storage files and process details remain private. */
@@ -103,8 +144,10 @@ export interface SubagentRuntime {
 
 interface StoredNode {
 	id: string;
+	agent: string;
 	logicalRole: string;
 	state: LifecycleState;
+	policy: ExecutionPolicy;
 	artifacts: Artifact[];
 	usage?: UsageRecord;
 	resultPath?: string;
@@ -131,8 +174,21 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			}
 
 			const definition = immutableNodeDefinition(graph.nodes[0]!);
+			if (!definition.agent.trim()) throw new Error("Node agent must not be empty");
 			if (!definition.logicalRole.trim()) throw new Error("Node logicalRole must not be empty");
 			if (!definition.task.trim()) throw new Error("Node task must not be empty");
+
+			const agentDefinition = await resolveAgentDefinition(
+				definition.agent,
+				configuredDefinitionDirectories(options.cwd ?? process.cwd(), options.definitionDirectories),
+			);
+			if (agentDefinition.id !== definition.agent) {
+				throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
+			}
+			const policy = resolveExecutionPolicy(definition, agentDefinition, options.cwd ?? process.cwd());
+			if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
+				throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
+			}
 
 			const runId = `run_${randomUUID()}`;
 			const nodeId = `node_${randomUUID()}`;
@@ -141,8 +197,10 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			const manifestPath = join(runDirectory, "artifacts.json");
 			const node: StoredNode = {
 				id: nodeId,
+				agent: definition.agent,
 				logicalRole: definition.logicalRole,
 				state: "queued",
+				policy,
 				artifacts: [],
 			};
 			const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes: [node] };
@@ -159,11 +217,18 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				outcome = await runner.run({
 					runId,
 					nodeId,
+					agent: policy.agent,
 					logicalRole: definition.logicalRole,
 					task: definition.task,
-					cwd: definition.cwd ?? process.cwd(),
-					model: definition.model,
-					tools: definition.tools,
+					cwd: policy.cwd,
+					provider: policy.provider,
+					model: policy.model,
+					reasoning: policy.reasoning,
+					tools: policy.tools,
+					systemPrompt: childSystemPrompt(agentDefinition, policy),
+					freshResources: true,
+					recursiveDelegation: false,
+					approvalPrompts: false,
 				});
 			} catch (error) {
 				outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
@@ -175,8 +240,8 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				path: resultPath,
 			};
 			const result: NodeResult = outcome.state === "completed"
-				? { state: "completed", output: outcome.output, usage: outcome.usage }
-				: { state: "failed", error: outcome.error, usage: outcome.usage };
+				? { state: "completed", output: outcome.output, usage: outcome.usage, policy }
+				: { state: "failed", error: outcome.error, usage: outcome.usage, policy };
 
 			// Persist the complete terminal result and manifest before terminal state.
 			await writeJsonAtomically(resultPath, result);
@@ -214,11 +279,87 @@ function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly
 	return Object.freeze({ ...definition, ...(tools ? { tools } : {}) });
 }
 
+const forbiddenChildTools = new Set([
+	"subagent_launch",
+	"subagent_status",
+	"subagent_join",
+	"subagent_cancel",
+	"subagent_resume",
+	"subagent_recover",
+]);
+
+function configuredDefinitionDirectories(
+	parentCwd: string,
+	overrides: Partial<DefinitionDirectories> | undefined,
+): DefinitionDirectories {
+	const defaults = defaultDefinitionDirectories(parentCwd);
+	return {
+		packaged: overrides?.packaged ?? defaults.packaged,
+		user: overrides?.user ?? defaults.user,
+		project: overrides?.project ?? defaults.project,
+	};
+}
+
+function resolveExecutionPolicy(
+	node: Readonly<NodeDefinition>,
+	definition: Awaited<ReturnType<typeof resolveAgentDefinition>>,
+	parentCwd: string,
+): ExecutionPolicy {
+	const additionalTools = node.tools ?? [];
+	for (const tool of additionalTools) {
+		if (!tool.trim()) throw new Error("Tool names must not be empty");
+		if (tool !== tool.trim()) throw new Error("Tool names must not include surrounding whitespace");
+		if (tool.includes(",")) throw new Error("Tool names must not contain commas");
+	}
+
+	const tools = [...new Set([...definition.tools, ...additionalTools])];
+	for (const tool of tools) {
+		if (forbiddenChildTools.has(tool)) throw new Error(`Child tool is not allowed: ${tool}`);
+	}
+
+	return Object.freeze({
+		agent: definition.id,
+		provider: node.provider ?? definition.provider,
+		model: node.model ?? definition.model,
+		reasoning: node.reasoning ?? definition.reasoning,
+		tools: Object.freeze(tools),
+		cwd: node.cwd ?? parentCwd,
+		runnerMode: "subprocess-json",
+		freshResources: true,
+		recursiveDelegation: false,
+		approvalPrompts: false,
+	});
+}
+
+function childSystemPrompt(
+	definition: Awaited<ReturnType<typeof resolveAgentDefinition>>,
+	policy: ExecutionPolicy,
+): string {
+	return [
+		"You are a bounded child agent in a fresh Pi process.",
+		"You receive only this task and the normal resources discovered from the declared working directory.",
+		"Do not attempt recursive delegation or orchestration; those tools are unavailable.",
+		"Tool allowlists are orchestration policy, not an OS security boundary.",
+		`Resolved execution identity: ${policy.agent}; provider: ${policy.provider}; model: ${policy.model}; reasoning: ${policy.reasoning}.`,
+		"",
+		"## Role",
+		definition.roleInstructions,
+		"",
+		"## Report contract",
+		definition.reportContract,
+		"",
+		"## Completion criteria",
+		definition.completionCriteria,
+	].join("\n");
+}
+
 function toNodeView(node: StoredNode, result?: NodeResult): NodeView {
 	return {
 		id: node.id,
+		agent: node.agent,
 		logicalRole: node.logicalRole,
 		state: node.state,
+		policy: node.policy,
 		artifacts: [...node.artifacts],
 		usage: node.usage,
 		...(result ? { result } : {}),
@@ -253,6 +394,32 @@ function withDuration(outcome: ChildRunnerResult, durationMs: number): ChildRunn
 	return { ...outcome, usage: { ...outcome.usage, durationMs: Math.max(0, durationMs) } };
 }
 
+function freshChildEnvironment(): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (
+			value !== undefined
+			&& (
+				name === "PATH"
+				|| name === "HOME"
+				|| name === "USER"
+				|| name === "LOGNAME"
+				|| name === "SHELL"
+				|| name === "TMPDIR"
+				|| name === "TERM"
+				|| name === "COLORTERM"
+				|| name === "LANG"
+				|| name === "PI_CODING_AGENT_DIR"
+				|| name === "XDG_CONFIG_HOME"
+				|| name.startsWith("LC_")
+			)
+		) {
+			environment[name] = value;
+		}
+	}
+	return environment;
+}
+
 /** Default runner: a one-shot Pi JSON subprocess with a fresh, ephemeral session. */
 export class SubprocessJsonRunner implements ChildRunner {
 	constructor(private readonly executable = "pi") {}
@@ -260,12 +427,20 @@ export class SubprocessJsonRunner implements ChildRunner {
 	async run(request: ChildRunnerRequest): Promise<ChildRunnerResult> {
 		const startedAt = Date.now();
 		const args = ["--mode", "json", "-p", "--no-session"];
-		if (request.model) args.push("--model", request.model);
-		if (request.tools && request.tools.length > 0) args.push("--tools", request.tools.join(","));
+		args.push("--provider", request.provider);
+		args.push("--model", request.model);
+		args.push("--thinking", request.reasoning);
+		args.push("--tools", request.tools.join(","));
+		args.push("--append-system-prompt", request.systemPrompt);
 		args.push(request.task);
 
 		return new Promise<ChildRunnerResult>((resolve, reject) => {
-			const child = spawn(this.executable, args, { cwd: request.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			const child = spawn(this.executable, args, {
+				cwd: request.cwd,
+				env: freshChildEnvironment(),
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
 			let stdout = "";
 			let stderr = "";
 			let settled = false;

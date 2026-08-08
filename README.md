@@ -103,6 +103,14 @@ After each completed turn, the footer shows usage in the form `ctx 117k`. A widg
 
 The widget is cleared when a session starts or context usage is unavailable.
 
+### Subagent policy
+
+Each child resolves one agent definition before launch. Definitions are selected in project, user, then packaged precedence and declare the provider, model, reasoning level, role instructions, report contract, completion criteria, and least-privilege tools. A node can temporarily add named tools or override its provider, model, or reasoning level without changing that definition or a sibling node.
+
+The child receives its declared working directory, task text, and fresh Pi resource discovery. It does not inherit the parent transcript, private reasoning, tool history, in-memory extension state, or secret values. Recursive orchestration and tools outside the effective allowlist are unavailable, and children do not receive interactive approval prompts.
+
+These restrictions are runtime orchestration controls, not an OS sandbox. A child still runs with the local user's operating-system permissions; graph authors remain responsible for coordinating concurrent writes in a shared worktree.
+
 ### Native handoff
 
 Run `/handoff` when the current session is becoming too large:
