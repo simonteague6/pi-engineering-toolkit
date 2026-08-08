@@ -26,7 +26,7 @@ export interface Artifact {
 }
 
 export interface FailureEvidence {
-	kind: "startup" | "stream" | "execution";
+	kind: "startup" | "stream" | "execution" | "cancelled";
 	message: string;
 	stderr?: string;
 	partialOutput?: string;
@@ -44,9 +44,26 @@ export interface NodeDefinition {
 	tools?: readonly string[];
 }
 
-/** The only graph shape supported by this first runtime slice. */
-export interface SingleNodeGraph {
+/** Public ergonomic form for exactly one child node. */
+export interface SingleGraph {
+	readonly kind: "single";
+	readonly node: Readonly<NodeDefinition>;
+}
+
+/** Public ergonomic form for independent sibling nodes. */
+export interface ParallelGraph {
+	readonly kind: "parallel";
 	readonly nodes: readonly Readonly<NodeDefinition>[];
+	/** A per-run lower concurrency limit. */
+	readonly maxConcurrency?: number;
+}
+
+/** Public graph forms normalized to one private immutable graph before execution. */
+export type GraphDefinition = SingleGraph | ParallelGraph;
+
+interface NormalizedGraph {
+	readonly nodes: readonly Readonly<NodeDefinition>[];
+	readonly maxConcurrency?: number;
 }
 
 export interface ChildRunnerRequest {
@@ -68,7 +85,8 @@ export interface ChildRunnerRequest {
 
 export type ChildRunnerResult =
 	| { state: "completed"; output: string; usage?: UsageRecord }
-	| { state: "failed"; error: FailureEvidence; usage?: UsageRecord };
+	| { state: "failed"; error: FailureEvidence; usage?: UsageRecord }
+	| { state: "cancelled"; error?: FailureEvidence; usage?: UsageRecord };
 
 /** Executes one fresh child without exposing its process protocol to callers. */
 export interface ChildRunner {
@@ -89,7 +107,7 @@ export interface ExecutionPolicy {
 }
 
 export interface NodeResult {
-	state: "completed" | "failed";
+	state: "completed" | "failed" | "cancelled";
 	output?: string;
 	error?: FailureEvidence;
 	usage?: UsageRecord;
@@ -112,9 +130,10 @@ export interface RunView {
 	state: LifecycleState;
 }
 
+/** Terminal aggregate in declaration order. */
 export interface LaunchResult {
 	run: RunView;
-	node: NodeView;
+	nodes: NodeView[];
 }
 
 export interface LaunchReceipt {
@@ -149,14 +168,16 @@ export interface SubagentRuntimeOptions {
 	cwd?: string;
 	definitionDirectories?: Partial<DefinitionDirectories>;
 	modelCatalog: ModelCatalog;
+	/** User-owned active-child ceiling; defaults to six. */
+	maxConcurrency?: number;
 }
 
 /** Stable public operations; storage files and process details remain private. */
 export interface SubagentRuntime {
-	launch(graph: SingleNodeGraph): Promise<LaunchReceipt>;
-	launch(graph: SingleNodeGraph, options: { delivery: "blocking" }): Promise<LaunchResult>;
-	launch(graph: SingleNodeGraph, options: { delivery: "detached" }): Promise<LaunchReceipt>;
-	launch(graph: SingleNodeGraph, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
+	launch(graph: GraphDefinition): Promise<LaunchReceipt>;
+	launch(graph: GraphDefinition, options: { delivery: "blocking" }): Promise<LaunchResult>;
+	launch(graph: GraphDefinition, options: { delivery: "detached" }): Promise<LaunchReceipt>;
+	launch(graph: GraphDefinition, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
 	join(runId: string): Promise<LaunchResult>;
 	result(runId: string, nodeId: string): Promise<NodeResult>;
@@ -189,67 +210,82 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 	const ownedDetachedRuns = new Map<string, Promise<LaunchResult>>();
 
 	const launch = (async (
-		graph: SingleNodeGraph,
+		graph: GraphDefinition,
 		launchOptions?: LaunchOptions,
 	): Promise<LaunchReceipt | LaunchResult> => {
-		if (graph.nodes.length !== 1) {
-			throw new Error("This runtime slice accepts exactly one node");
-		}
-
-		const definition = immutableNodeDefinition(graph.nodes[0]!);
-		if (!definition.agent.trim()) throw new Error("Node agent must not be empty");
-		if (!definition.logicalRole.trim()) throw new Error("Node logicalRole must not be empty");
-		if (!definition.task.trim()) throw new Error("Node task must not be empty");
-
-		const agentDefinition = await resolveAgentDefinition(
-			definition.agent,
-			configuredDefinitionDirectories(options.cwd ?? process.cwd(), options.definitionDirectories),
-		);
-		if (agentDefinition.id !== definition.agent) {
-			throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
-		}
-		const policy = resolveExecutionPolicy(definition, agentDefinition, options.cwd ?? process.cwd());
-		if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
-			throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
+		const normalizedGraph = immutableGraphDefinition(graph);
+		if (normalizedGraph.nodes.length === 0) throw new Error("Graph must contain at least one node");
+		const concurrency = effectiveConcurrencyLimit(options.maxConcurrency, normalizedGraph.maxConcurrency);
+		const parentCwd = options.cwd ?? process.cwd();
+		const definitionDirectories = configuredDefinitionDirectories(parentCwd, options.definitionDirectories);
+		const preparedNodes: Array<{
+			definition: Readonly<NodeDefinition>;
+			agentDefinition: Awaited<ReturnType<typeof resolveAgentDefinition>>;
+			policy: ExecutionPolicy;
+		}> = [];
+		for (const definition of normalizedGraph.nodes) {
+			validateNodeDefinition(definition);
+			const agentDefinition = await resolveAgentDefinition(definition.agent, definitionDirectories);
+			if (agentDefinition.id !== definition.agent) {
+				throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
+			}
+			const policy = resolveExecutionPolicy(definition, agentDefinition, parentCwd);
+			if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
+				throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
+			}
+			preparedNodes.push({ definition, agentDefinition, policy });
 		}
 
 		const runId = `run_${randomUUID()}`;
-		const nodeId = `node_${randomUUID()}`;
 		const runDirectory = join(options.storeDirectory, "runs", runId);
-		const resultPath = join(runDirectory, "artifacts", `${nodeId}.json`);
 		const manifestPath = join(runDirectory, "artifacts.json");
-		const node: StoredNode = {
-			id: nodeId,
+		const nodes: StoredNode[] = preparedNodes.map(({ definition, policy }) => ({
+			id: `node_${randomUUID()}`,
 			agent: definition.agent,
 			logicalRole: definition.logicalRole,
 			state: "queued",
 			policy,
 			artifacts: [],
+		}));
+		const resultPaths = nodes.map((node) => join(runDirectory, "artifacts", `${node.id}.json`));
+		const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes };
+		let snapshotWrite = Promise.resolve();
+		const persistSnapshot = (): Promise<void> => {
+			const write = snapshotWrite.then(() => writeSnapshot(runDirectory, snapshot));
+			snapshotWrite = write;
+			return write;
 		};
-		const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes: [node] };
 
-		await writeJsonAtomically(join(runDirectory, "graph.json"), { nodes: [definition] });
-		await writeSnapshot(runDirectory, snapshot);
+		await writeJsonAtomically(join(runDirectory, "graph.json"), normalizedGraph);
+		await persistSnapshot();
 		snapshot.run.state = "running";
-		node.state = "running";
-		await writeSnapshot(runDirectory, snapshot);
+		for (const node of nodes.slice(0, Math.min(concurrency, nodes.length))) node.state = "running";
+		await persistSnapshot();
 
-		const execution = (async (): Promise<LaunchResult> => {
+		const executeNode = async (index: number): Promise<NodeView> => {
+			const prepared = preparedNodes[index]!;
+			const node = nodes[index]!;
+			const resultPath = resultPaths[index]!;
+			if (node.state === "queued") {
+				node.state = "running";
+				await persistSnapshot();
+			}
+
 			const startedAt = Date.now();
 			let outcome: ChildRunnerResult;
 			try {
 				outcome = await runner.run({
 					runId,
-					nodeId,
-					agent: policy.agent,
-					logicalRole: definition.logicalRole,
-					task: definition.task,
-					cwd: policy.cwd,
-					provider: policy.provider,
-					model: policy.model,
-					reasoning: policy.reasoning,
-					tools: policy.tools,
-					systemPrompt: childSystemPrompt(agentDefinition, policy),
+					nodeId: node.id,
+					agent: prepared.policy.agent,
+					logicalRole: prepared.definition.logicalRole,
+					task: prepared.definition.task,
+					cwd: prepared.policy.cwd,
+					provider: prepared.policy.provider,
+					model: prepared.policy.model,
+					reasoning: prepared.policy.reasoning,
+					tools: prepared.policy.tools,
+					systemPrompt: childSystemPrompt(prepared.agentDefinition, prepared.policy),
 					freshResources: true,
 					recursiveDelegation: false,
 					approvalPrompts: false,
@@ -264,20 +300,43 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				path: resultPath,
 			};
 			const result: NodeResult = outcome.state === "completed"
-				? { state: "completed", output: outcome.output, usage: outcome.usage, policy }
-				: { state: "failed", error: outcome.error, usage: outcome.usage, policy };
+				? { state: "completed", output: outcome.output, usage: outcome.usage, policy: prepared.policy }
+				: {
+					state: outcome.state,
+					...(outcome.error === undefined ? {} : { error: outcome.error }),
+					usage: outcome.usage,
+					policy: prepared.policy,
+				};
 
-			// Persist the complete terminal result and manifest before terminal state.
+			// Persist the complete terminal result before exposing the terminal node state.
 			await writeJsonAtomically(resultPath, result);
-			await writeJsonAtomically(manifestPath, [artifact]);
 			node.artifacts = [artifact];
 			node.usage = outcome.usage;
 			node.resultPath = resultPath;
 			node.state = outcome.state;
-			snapshot.run.state = outcome.state;
-			await writeSnapshot(runDirectory, snapshot);
+			await persistSnapshot();
 
-			return { run: { ...snapshot.run }, node: toNodeView(node, result) };
+			return toNodeView(node, result);
+		};
+
+		const execution = (async (): Promise<LaunchResult> => {
+			let nextIndex = 0;
+			const results: NodeView[] = new Array(nodes.length);
+			const worker = async (): Promise<void> => {
+				while (nextIndex < nodes.length) {
+					const index = nextIndex;
+					nextIndex += 1;
+					results[index] = await executeNode(index);
+				}
+			};
+			await Promise.all(Array.from({ length: Math.min(concurrency, nodes.length) }, worker));
+
+			await writeJsonAtomically(manifestPath, nodes.flatMap((node) => node.artifacts));
+			snapshot.run.state = results.some((node) => node.state === "cancelled")
+				? "cancelled"
+				: results.every((node) => node.state === "completed") ? "completed" : "failed";
+			await persistSnapshot();
+			return { run: { ...snapshot.run }, nodes: results };
 		})();
 
 		if (launchOptions?.delivery === "blocking") return execution;
@@ -321,6 +380,39 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly<NodeDefinition> {
 	const tools = definition.tools ? Object.freeze([...definition.tools]) : undefined;
 	return Object.freeze({ ...definition, ...(tools ? { tools } : {}) });
+}
+
+export const DEFAULT_MAX_CONCURRENCY = 6;
+
+function immutableGraphDefinition(graph: GraphDefinition): NormalizedGraph {
+	const definitions = graph.kind === "single" ? [graph.node] : graph.nodes;
+	if (!Array.isArray(definitions)) throw new Error("Graph nodes must be an array");
+	const nodes = Object.freeze(definitions.map(immutableNodeDefinition));
+	return Object.freeze({
+		nodes,
+		...(graph.kind === "parallel" && graph.maxConcurrency !== undefined
+			? { maxConcurrency: graph.maxConcurrency }
+			: {}),
+	});
+}
+
+function validateNodeDefinition(definition: Readonly<NodeDefinition>): void {
+	if (!definition.agent.trim()) throw new Error("Node agent must not be empty");
+	if (!definition.logicalRole.trim()) throw new Error("Node logicalRole must not be empty");
+	if (!definition.task.trim()) throw new Error("Node task must not be empty");
+}
+
+function effectiveConcurrencyLimit(userLimit: number | undefined, runLimit: number | undefined): number {
+	const ceiling = userLimit ?? DEFAULT_MAX_CONCURRENCY;
+	validateConcurrencyLimit("Runtime maxConcurrency", ceiling);
+	if (runLimit !== undefined) validateConcurrencyLimit("Graph maxConcurrency", runLimit);
+	return Math.min(ceiling, runLimit ?? ceiling);
+}
+
+function validateConcurrencyLimit(label: string, limit: number): void {
+	if (!Number.isSafeInteger(limit) || limit < 1) {
+		throw new Error(`${label} must be a positive safe integer`);
+	}
 }
 
 const forbiddenChildTools = new Set([
@@ -548,7 +640,15 @@ export class SubprocessJsonRunner implements ChildRunner {
 					outputTokens,
 					durationMs: Math.max(0, Date.now() - startedAt),
 				};
-				if (code !== 0 || stopReason === "error" || stopReason === "aborted") {
+				if (stopReason === "aborted") {
+					resolve({
+						state: "cancelled",
+						error: { kind: "cancelled", message: "Pi stopped before settlement", stderr, partialOutput: finalOutput },
+						usage,
+					});
+					return;
+				}
+				if (code !== 0 || stopReason === "error") {
 					resolve({
 						state: "failed",
 						error: { kind: "execution", message: stopReason ?? `Pi exited with code ${code ?? "unknown"}`, stderr, partialOutput: finalOutput },
