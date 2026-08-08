@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1445,7 +1445,7 @@ describe("run resource accounting and retention", () => {
 				if (request.logicalRole === "Upstream") return { state: "completed", output: "durable predecessor" };
 				started!();
 				options?.onActivityChange?.(true);
-				await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", resolve, { once: true }));
+				await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
 				return { state: "cancelled", error: { kind: "cancelled", message: "suspended" } };
 			},
 		};
@@ -1551,29 +1551,28 @@ describe("subprocess JSON runner", () => {
 			tools: ["read", "grep"],
 			systemPrompt: "bounded policy prompt",
 		};
+		const auditPath = join(cwd, "child-audit.json");
 		const expectedArguments = [
 			"--mode", "json", "-p", "--no-session",
 			"--provider", "policy-provider",
 			"--model", "policy-model",
 			"--thinking", "high",
 			"--tools", "read,grep",
-			"--append-system-prompt", "bounded policy prompt",
-			"Inspect the repository",
+			"--append-system-prompt",
 		];
 
 		try {
 			await withSubprocessRunner(`
-				const expected = ${JSON.stringify(expectedArguments)};
 				const supplied = process.argv.slice(2);
+				const promptPath = supplied[${expectedArguments.length}];
 				const checks = {
 					cwd: process.cwd() === ${JSON.stringify(resolvedCwd)},
-					args: expected.every((value, index) => supplied[index] === value),
+					args: ${JSON.stringify(expectedArguments)}.every((value, index) => supplied[index] === value)
+						&& supplied.at(-1) === "Inspect the repository",
 					secret: process.env.PI_SUBAGENT_TEST_SECRET === undefined,
 				};
-				if (!checks.cwd || !checks.args || !checks.secret) {
-					console.error(JSON.stringify({ checks, supplied }));
-					process.exit(9);
-				}
+				await Bun.write(${JSON.stringify(auditPath)}, JSON.stringify({ checks, promptPath, prompt: await Bun.file(promptPath).text() }));
+				if (!checks.cwd || !checks.args || !checks.secret) process.exit(9);
 				console.log(JSON.stringify({ type: "message_end", message: {
 					role: "assistant", content: [{ type: "text", text: "fresh" }], stopReason: "stop",
 				} }));
@@ -1581,11 +1580,23 @@ describe("subprocess JSON runner", () => {
 			`, async (runner) => {
 				await expect(runner.run(request)).resolves.toMatchObject({ state: "completed", output: "fresh" });
 			});
+			const audit = JSON.parse(await readFile(auditPath, "utf8")) as { checks: Record<string, boolean>; promptPath: string; prompt: string };
+			expect(audit.checks).toEqual({ cwd: true, args: true, secret: true });
+			expect(audit.prompt).toBe("bounded policy prompt");
+			await expect(readFile(audit.promptPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			if (originalSecret === undefined) delete process.env.PI_SUBAGENT_TEST_SECRET;
 			else process.env.PI_SUBAGENT_TEST_SECRET = originalSecret;
 			await rm(cwd, { recursive: true, force: true });
 		}
+	});
+
+	test("reports process startup errors without leaking a rejected runner promise", async () => {
+		const runner = new SubprocessJsonRunner(join(tmpdir(), "missing-pi-executable"));
+		await expect(runner.run(childRequest())).resolves.toMatchObject({
+			state: "failed",
+			error: { kind: "startup", message: expect.stringContaining("ENOENT") },
+		});
 	});
 
 	test("fails when a JSONL event is malformed and preserves stderr", async () => {

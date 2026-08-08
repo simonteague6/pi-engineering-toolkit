@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	defaultDefinitionDirectories,
@@ -330,8 +330,8 @@ export interface SubagentRuntimeOptions {
 /** Stable public operations; storage files and process details remain private. */
 export interface SubagentRuntime {
 	launch(graph: GraphDefinition): Promise<LaunchReceipt>;
-	launch(graph: GraphDefinition, options: { delivery: "blocking" }): Promise<LaunchResult>;
-	launch(graph: GraphDefinition, options: { delivery: "detached" }): Promise<LaunchReceipt>;
+	launch(graph: GraphDefinition, options: { delivery: "blocking"; idleLimitMs?: number }): Promise<LaunchResult>;
+	launch(graph: GraphDefinition, options: { delivery: "detached"; idleLimitMs?: number }): Promise<LaunchReceipt>;
 	launch(graph: GraphDefinition, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
 	/** Lists runs owned by the current parent session in stable ID order. */
@@ -343,8 +343,8 @@ export interface SubagentRuntime {
 	resume(runId: string): Promise<LaunchResult>;
 	/** Creates a new run that replaces failed roles and reuses unaffected durable work. */
 	recover(runId: string, plan: RecoveryPlan): Promise<LaunchReceipt>;
-	recover(runId: string, plan: RecoveryPlan, options: { delivery: "blocking" }): Promise<LaunchResult>;
-	recover(runId: string, plan: RecoveryPlan, options: { delivery: "detached" }): Promise<LaunchReceipt>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "blocking"; idleLimitMs?: number }): Promise<LaunchResult>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "detached"; idleLimitMs?: number }): Promise<LaunchReceipt>;
 	recover(runId: string, plan: RecoveryPlan, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	/** Gracefully suspends runtime-owned active runs. */
 	dispose(): Promise<void>;
@@ -1452,15 +1452,30 @@ export class SubprocessJsonRunner implements ChildRunner {
 
 	async run(request: ChildRunnerRequest, options: ChildRunnerOptions = {}): Promise<ChildRunnerResult> {
 		const startedAt = Date.now();
-		const args = ["--mode", "json", "-p", "--no-session"];
-		args.push("--provider", request.provider);
-		args.push("--model", request.model);
-		args.push("--thinking", request.reasoning);
-		args.push("--tools", request.tools.join(","));
-		args.push("--append-system-prompt", request.systemPrompt);
-		args.push(request.task);
+		let promptDirectory: string | undefined;
+		try {
+			promptDirectory = await mkdtemp(join(tmpdir(), "pi-engineering-subagent-"));
+			const promptPath = join(promptDirectory, "system-prompt.md");
+			await writeFile(promptPath, request.systemPrompt, { encoding: "utf8", mode: 0o600 });
+			return await this.runProcess(request, promptPath, options, startedAt);
+		} catch (error) {
+			return { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
+		} finally {
+			if (promptDirectory) await rm(promptDirectory, { recursive: true, force: true }).catch(() => undefined);
+		}
+	}
 
-		return new Promise<ChildRunnerResult>((resolve, reject) => {
+	private runProcess(
+		request: ChildRunnerRequest,
+		promptPath: string,
+		options: ChildRunnerOptions,
+		startedAt: number,
+	): Promise<ChildRunnerResult> {
+		const args = ["--mode", "json", "-p", "--no-session"];
+		args.push("--provider", request.provider, "--model", request.model, "--thinking", request.reasoning);
+		args.push("--tools", request.tools.join(","), "--append-system-prompt", promptPath, request.task);
+
+		return new Promise<ChildRunnerResult>((resolve) => {
 			let child: ReturnType<typeof spawn>;
 			try {
 				child = spawn(this.executable, args, {
@@ -1470,9 +1485,15 @@ export class SubprocessJsonRunner implements ChildRunner {
 					stdio: ["ignore", "pipe", "pipe"],
 				});
 			} catch (error) {
-				reject(error);
+				resolve({ state: "failed", error: { kind: "startup", message: errorMessage(error) } });
 				return;
 			}
+			if (!child.stdout || !child.stderr) {
+				try { child.kill("SIGKILL"); } catch { /* The incomplete child has already exited. */ }
+				resolve({ state: "failed", error: { kind: "startup", message: "Child process did not expose piped stdout and stderr" } });
+				return;
+			}
+
 			let stdout = "";
 			let stderr = "";
 			let settled = false;
@@ -1485,37 +1506,42 @@ export class SubprocessJsonRunner implements ChildRunner {
 			let outputTokens: number | undefined;
 			let contextTokens: number | undefined;
 			let cost: number | undefined;
-			let abortRequested = options.signal?.aborted ?? false;
+			let abortRequested = false;
 			let killTimer: ReturnType<typeof setTimeout> | undefined;
-			const abort = () => {
-				abortRequested = true;
-				child.kill("SIGTERM");
-				killTimer = setTimeout(() => child.kill("SIGKILL"), options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS);
+			let completed = false;
+			const usage = (): UsageRecord => ({
+				provider, model, inputTokens, outputTokens, contextTokens, cost,
+				durationMs: Math.max(0, Date.now() - startedAt),
+			});
+			const cleanup = () => {
+				if (killTimer !== undefined) clearTimeout(killTimer);
+				if (options.signal) options.signal.removeEventListener("abort", abort);
+				options.onActivityChange?.(false);
 			};
-			if (!child.stdout || !child.stderr) {
-				reject(new Error("Child process did not expose piped stdout and stderr"));
-				return;
-			}
-			if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
-			if (abortRequested) abort();
-			// Until Pi reports agent or tool activity, a stalled child is idle.
-			options.onActivityChange?.(false);
-
+			const finish = (result: ChildRunnerResult) => {
+				if (completed) return;
+				completed = true;
+				cleanup();
+				resolve(result);
+			};
+			const kill = (signal: NodeJS.Signals) => {
+				try { child.kill(signal); } catch { /* The child has already exited. */ }
+			};
+			const abort = () => {
+				if (abortRequested) return;
+				abortRequested = true;
+				kill("SIGTERM");
+				killTimer = setTimeout(() => kill("SIGKILL"), options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS);
+			};
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
 				let event: unknown;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					malformedEvent = true;
-					return;
-				}
+				try { event = JSON.parse(line); } catch { malformedEvent = true; return; }
 				if (!isRecord(event)) return;
 				if (event.type === "agent_start" || event.type === "tool_execution_start") options.onActivityChange?.(true);
 				if (event.type === "agent_end" || event.type === "tool_execution_end" || event.type === "agent_settled") options.onActivityChange?.(false);
 				if (event.type === "agent_settled") settled = true;
 				if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return;
-
 				finalOutput = textContent(event.message.content);
 				stopReason = stringValue(event.message.stopReason);
 				provider = stringValue(event.message.provider);
@@ -1535,52 +1561,23 @@ export class SubprocessJsonRunner implements ChildRunner {
 				for (const line of lines) processLine(line);
 			});
 			child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-			child.once("error", reject);
+			child.once("error", (error) => finish({ state: "failed", error: { kind: "startup", message: errorMessage(error), stderr }, usage: usage() }));
 			child.once("close", (code) => {
-				if (killTimer !== undefined) clearTimeout(killTimer);
-				if (options.signal) options.signal.removeEventListener("abort", abort);
-				options.onActivityChange?.(false);
 				processLine(stdout);
-				const usage: UsageRecord = {
-					provider,
-					model,
-					inputTokens,
-					outputTokens,
-					contextTokens,
-					cost,
-					durationMs: Math.max(0, Date.now() - startedAt),
-				};
 				if (abortRequested || stopReason === "aborted") {
-					resolve({
-						state: "cancelled",
-						error: { kind: "cancelled", message: "Pi stopped before settlement", stderr, partialOutput: finalOutput },
-						usage,
-					});
-					return;
+					finish({ state: "cancelled", error: { kind: "cancelled", message: "Pi stopped before settlement", stderr, partialOutput: finalOutput }, usage: usage() });
+				} else if (code !== 0 || stopReason === "error") {
+					finish({ state: "failed", error: { kind: "execution", message: stopReason ?? `Pi exited with code ${code ?? "unknown"}`, stderr, partialOutput: finalOutput }, usage: usage() });
+				} else if (malformedEvent || !settled || finalOutput === undefined) {
+					finish({ state: "failed", error: { kind: "stream", message: malformedEvent ? "Pi emitted malformed JSON" : "Pi exited without settled final assistant output", stderr, partialOutput: finalOutput }, usage: usage() });
+				} else {
+					finish({ state: "completed", output: finalOutput, usage: usage() });
 				}
-				if (code !== 0 || stopReason === "error") {
-					resolve({
-						state: "failed",
-						error: { kind: "execution", message: stopReason ?? `Pi exited with code ${code ?? "unknown"}`, stderr, partialOutput: finalOutput },
-						usage,
-					});
-					return;
-				}
-				if (malformedEvent || !settled || finalOutput === undefined) {
-					resolve({
-						state: "failed",
-						error: {
-							kind: "stream",
-							message: malformedEvent ? "Pi emitted malformed JSON" : "Pi exited without settled final assistant output",
-							stderr,
-							partialOutput: finalOutput,
-						},
-						usage,
-					});
-					return;
-				}
-				resolve({ state: "completed", output: finalOutput, usage });
 			});
+			if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
+			if (options.signal?.aborted) abort();
+			// Until Pi reports agent or tool activity, a stalled child is idle.
+			options.onActivityChange?.(false);
 		});
 	}
 }

@@ -52,8 +52,9 @@ Restart pi, or run `/reload`, after installing. Use `pi list` to confirm that th
 
 ### Requirements
 
-- [pi](https://pi.dev/) with pi package support
-- An authenticated pi model for profiles and `/handoff`
+- Node.js `>=22.19.0`
+- [pi](https://pi.dev/) `>=0.80.8 <0.83.0` (smoke-tested with 0.80.8 and 0.82.1)
+- An authenticated pi model for profiles, `/handoff`, and subagents
 - A system clipboard backend for `/copy-code`:
   - macOS: `pbcopy`
   - Windows: `clip`
@@ -63,7 +64,61 @@ Restart pi, or run `/reload`, after installing. Use `pi list` to confirm that th
 
 ### Subagents
 
-Run `/subagents` in TUI mode to open the full-screen control center. The Runs view shows current-session runs, node lifecycle states, dependency edges, available usage, and durable result details. Settings edits the selected agent definition directly; project definitions take precedence over user and packaged definitions.
+Subagent System v1 delegates bounded work to fresh Pi subprocesses. It supports one child, independent parallel children, ordered chains, and static dependency graphs. The parent agent launches and controls runs through six tools:
+
+| Tool | Use |
+| --- | --- |
+| `subagent_launch` | Start a single, parallel, chain, or DAG run. |
+| `subagent_status` | Read compact state, usage, and durable artifact paths. |
+| `subagent_join` | Wait for a detached run's terminal result. |
+| `subagent_cancel` | End an entire run, or one node and its descendants. |
+| `subagent_resume` | Explicitly continue a suspended run. |
+| `subagent_recover` | Start a new run that replaces failed logical roles. |
+
+Extensions that need the supported TypeScript seam import it from the explicit package subpath:
+
+```ts
+import { createSubagentRuntime, type GraphDefinition } from "pi-engineering-kit/subagents";
+```
+
+The supported seam is the graph and lifecycle API. The Pi command arguments, JSON stream protocol, process runner, locks, and on-disk layout are package internals.
+
+`subagent_launch` accepts these graph forms:
+
+```text
+single:   { kind: "single", node: { agent, logicalRole, task } }
+parallel: { kind: "parallel", nodes: [{ agent, logicalRole, task }, ...] }
+chain:    { kind: "chain", nodes: [{ agent, logicalRole, task }, ...] }
+dag:      { kind: "dag", nodes: [{ id, agent, logicalRole, task, dependsOn }, ...] }
+```
+
+`maxConcurrency`, `delivery` (`detached` or `blocking`), and `idleLimitMs` are optional launch controls. A DAG must use unique IDs and be acyclic.
+
+#### Launch and delivery
+
+`subagent_launch` defaults to **detached** delivery: it returns a small receipt while the child continues. Use `subagent_join` when the final result is needed. Choose **blocking** delivery only when the parent turn must wait for the terminal result. Each run has a user-owned concurrency ceiling (six by default) and an idle limit (ten minutes by default); a graph can lower, but never raise, that ceiling.
+
+A child receives its declared working directory, task text, selected definition, and fresh Pi resource discovery. It starts with no parent transcript or in-memory extension state. A completed node writes its full durable result before the runtime marks it complete. Chain and graph successors receive complete predecessor handoffs, inline when small and through an artifact path when large.
+
+#### Lifecycle, recovery, and retention
+
+Runs and nodes are `queued`, `running`, `completed`, `failed`, `cancelled`, or `suspended`. Cancellation is terminal. Shutdown and reload suspend active work; call `subagent_resume` to continue from durable evidence. For a failed graph, `subagent_recover` creates a new run with an immutable lineage, replaces each failed logical role, and reuses unaffected successful artifacts.
+
+The package stores run snapshots, lifecycle events, results, handoffs, and notifications under:
+
+```text
+$PI_CODING_AGENT_DIR/pi-engineering-toolkit/runs/<runId>/
+```
+
+The default base directory is `~/.pi/agent/pi-engineering-toolkit/`. Terminal run data is retained for 30 days. Cleanup never removes active or suspended runs, or evidence for undelivered parent notifications. Parent notifications are compact and wait until the parent is idle; they do not interrupt a turn.
+
+#### Safety limits and interface modes
+
+Definitions resolve in project, user, then packaged precedence. A child uses only its definition allowlist plus explicit node additions. Recursive subagent tools and interactive approval prompts are unavailable. These controls are **not** an operating-system sandbox: children retain the local user's OS permissions. Use a container or VM for OS isolation.
+
+Run `/subagents` in TUI mode to open the full-screen control center. The Runs view shows current-session runs, node lifecycle states, dependency edges, available usage, and durable result details. Settings edits definition-backed provider, model, and reasoning defaults; project definitions take precedence over user and packaged definitions.
+
+In print, JSON, or RPC mode, `/subagents` does not open a TUI. The six parent tools remain available, and their compact JSON results include run state and durable artifact paths for scripts and non-TUI clients.
 
 ### Profiles
 

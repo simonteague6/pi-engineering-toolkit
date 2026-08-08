@@ -4,6 +4,15 @@
   "description": "A SDLC workflow biased towards Matt Pocock's skills repo.",
   "keywords": ["pi-package"],
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    "./subagents": "./subagents/index.ts"
+  },
+  "piEngineeringKit": {
+    "supportedPiVersions": ["0.80.8", "0.82.1"]
+  },
   "pi": {
     "extensions": [
       "./extensions/context-usage-meter.ts",
@@ -16,12 +25,13 @@
     ]
   },
   "devDependencies": {
+    "@types/bun": "1.3.14",
     "typescript": "^5"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": ">=0.80.8 <0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.8 <0.83.0",
+    "@earendil-works/pi-tui": ">=0.80.8 <0.83.0",
     "typebox": "*"
   }
 }
