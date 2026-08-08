@@ -133,8 +133,9 @@ describe("subagent runtime", () => {
 				state: "completed",
 				output: "Found the runtime boundary.",
 				usage: {
-					provider: "test",
-					model: "deterministic",
+					provider: "openai",
+					model: "gpt-5.6-luna",
+					reasoning: "medium",
 					inputTokens: 12,
 					outputTokens: 5,
 					durationMs: expect.any(Number),
@@ -146,7 +147,7 @@ describe("subagent runtime", () => {
 					approvalPrompts: false,
 				},
 			});
-			expect(node.usage).toMatchObject({ provider: "test", model: "deterministic", inputTokens: 12, outputTokens: 5 });
+			expect(node.usage).toMatchObject({ provider: "openai", model: "gpt-5.6-luna", reasoning: "medium", inputTokens: 12, outputTokens: 5 });
 			expect(node.artifacts).toHaveLength(1);
 			expect(node.artifacts[0]!.kind).toBe("result");
 			expect(typeof node.artifacts[0]!.path).toBe("string");
@@ -1142,6 +1143,133 @@ describe("run control", () => {
 				error: { kind: "timeout" },
 			});
 		}, { clock });
+	});
+});
+
+describe("run resource accounting and retention", () => {
+	test("records resolved execution identity, marks missing tokens unavailable, and aggregates only supplied tokens", async () => {
+		const clock = new FakeClock();
+		const runner: ChildRunner = {
+			run: async (request) => request.logicalRole === "Input usage"
+				? { state: "completed", output: "input", usage: { provider: "incorrect-provider", model: "incorrect-model", inputTokens: 12 } }
+				: { state: "completed", output: "output", usage: { outputTokens: 7 } },
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const result = await runtime.launch({
+				kind: "parallel",
+				nodes: [
+					{ agent: "worker", logicalRole: "Input usage", task: "Return input usage." },
+					{ agent: "worker", logicalRole: "Output usage", task: "Return output usage." },
+				],
+			}, { delivery: "blocking" });
+
+			expect(result.nodes.map((node) => node.usage)).toEqual([
+				expect.objectContaining({
+					provider: "openai", model: "gpt-5.6-luna", reasoning: "medium",
+					inputTokens: 12, outputTokens: "unavailable", durationMs: 0,
+				}),
+				expect.objectContaining({
+					provider: "openai", model: "gpt-5.6-luna", reasoning: "medium",
+					inputTokens: "unavailable", outputTokens: 7, durationMs: 0,
+				}),
+			]);
+			expect(result.usage).toEqual({
+				inputTokens: 12,
+				outputTokens: 7,
+				durationMs: 0,
+				unavailable: ["inputTokens", "outputTokens"],
+			});
+			expect((await runtime.status(result.run.id)).usage).toEqual(result.usage);
+		}, { clock });
+	});
+
+	test("uses the package run store by default instead of the declared worktree", async () => {
+		const agentDirectory = await mkdtemp(join(tmpdir(), "pi-agent-directory-"));
+		const worktree = await mkdtemp(join(tmpdir(), "pi-worktree-"));
+		const originalAgentDirectory = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDirectory;
+		try {
+			const runtime = createSubagentRuntime({
+				cwd: worktree,
+				runner: { run: async () => ({ state: "completed", output: "stored outside worktree" }) },
+				modelCatalog: { isAvailable: () => true },
+			});
+			const result = await runtime.launch(singleNode(), { delivery: "blocking" });
+			expect((await runtime.status(result.run.id)).run.state).toBe("completed");
+			for (const artifact of result.artifacts) {
+				expect(artifact.path.startsWith(agentDirectory)).toBe(true);
+				expect(artifact.path.startsWith(worktree)).toBe(false);
+			}
+		} finally {
+			if (originalAgentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalAgentDirectory;
+			await Promise.all([rm(agentDirectory, { recursive: true, force: true }), rm(worktree, { recursive: true, force: true })]);
+		}
+	});
+
+	test("cleans expired terminal runs at the retention boundary and is idempotent", async () => {
+		const clock = new FakeClock();
+		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "expired evidence" }) };
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+				retentionPeriodMs: 10,
+				clock,
+			});
+			const result = await runtime.launch(singleNode(), { delivery: "blocking" });
+
+			clock.advance(9);
+			expect(await runtime.cleanup()).toEqual({ removedRunIds: [], preservedRunIds: [result.run.id] });
+			clock.advance(1);
+			expect(await runtime.cleanup()).toEqual({ removedRunIds: [result.run.id], preservedRunIds: [] });
+			await expect(runtime.status(result.run.id)).rejects.toThrow(`Unknown run: ${result.run.id}`);
+			expect(await runtime.cleanup()).toEqual({ removedRunIds: [], preservedRunIds: [] });
+		});
+	});
+
+	test("cleanup preserves active and suspended run evidence regardless of expiry", async () => {
+		const clock = new FakeClock();
+		let started: (() => void) | undefined;
+		const runner: ChildRunner = {
+			run: async (request, options) => {
+				if (request.logicalRole === "Upstream") return { state: "completed", output: "durable predecessor" };
+				started!();
+				options?.onActivityChange?.(true);
+				await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", resolve, { once: true }));
+				return { state: "cancelled", error: { kind: "cancelled", message: "suspended" } };
+			},
+		};
+		const running = new Promise<void>((resolve) => { started = resolve; });
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+				retentionPeriodMs: 10,
+				clock,
+			});
+			const receipt = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "upstream", agent: "worker", logicalRole: "Upstream", task: "Produce durable evidence." },
+					{ id: "downstream", agent: "worker", logicalRole: "Downstream", task: "Use the evidence.", dependsOn: ["upstream"] },
+				],
+			});
+			await running;
+			clock.advance(10);
+			expect(await runtime.cleanup()).toEqual({ removedRunIds: [], preservedRunIds: [receipt.run.id] });
+			await runtime.dispose();
+
+			const recreated = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true }, retentionPeriodMs: 10, clock });
+			expect(await recreated.cleanup()).toEqual({ removedRunIds: [], preservedRunIds: [receipt.run.id] });
+			expect(await recreated.result(receipt.run.id, "upstream")).toMatchObject({ state: "completed", output: "durable predecessor" });
+			expect(await recreated.result(receipt.run.id, "downstream")).toMatchObject({ state: "suspended" });
+		});
 	});
 });
 

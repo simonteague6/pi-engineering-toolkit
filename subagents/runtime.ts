@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
 	defaultDefinitionDirectories,
@@ -11,12 +12,16 @@ import {
 
 export type LifecycleState = "queued" | "running" | "completed" | "failed" | "cancelled" | "suspended";
 
+export type TokenUsage = number | "unavailable";
+export type TokenUsageField = "inputTokens" | "outputTokens";
+
+/** Resolved node identity plus provider-supplied usage; never an estimate. */
 export interface UsageRecord {
 	provider?: string;
 	model?: string;
-	reasoning?: string;
-	inputTokens?: number;
-	outputTokens?: number;
+	reasoning?: ReasoningLevel;
+	inputTokens?: TokenUsage;
+	outputTokens?: TokenUsage;
 	durationMs?: number;
 }
 
@@ -188,6 +193,8 @@ export interface RunView {
 export interface LaunchResult {
 	run: RunView;
 	nodes: NodeView[];
+	/** Sums only provider-supplied token values; unavailable values are explicit. */
+	usage?: UsageTotals;
 	finalOutput?: string;
 	trace: NodeTrace[];
 	artifacts: Artifact[];
@@ -223,6 +230,13 @@ export interface UsageTotals {
 	inputTokens?: number;
 	outputTokens?: number;
 	durationMs?: number;
+	/** Fields unavailable for one or more nodes; totals never estimate them. */
+	unavailable: readonly TokenUsageField[];
+}
+
+export interface CleanupResult {
+	removedRunIds: string[];
+	preservedRunIds: string[];
 }
 
 export interface StatusView {
@@ -236,7 +250,10 @@ export interface ModelCatalog {
 }
 
 export interface SubagentRuntimeOptions {
-	storeDirectory: string;
+	/** Isolated-store override for tests; normal callers use the package-owned Pi store. */
+	storeDirectory?: string;
+	/** Terminal run-data retention; defaults to 30 days. */
+	retentionPeriodMs?: number;
 	runner?: ChildRunner;
 	/** The parent working directory used when a graph node omits cwd. */
 	cwd?: string;
@@ -266,6 +283,8 @@ export interface SubagentRuntime {
 	resume(runId: string): Promise<LaunchResult>;
 	/** Gracefully suspends runtime-owned active runs. */
 	dispose(): Promise<void>;
+	/** Removes expired terminal run data while preserving non-terminal runs. */
+	cleanup(): Promise<CleanupResult>;
 	events(runId: string): Promise<LifecycleEvent[]>;
 	result(runId: string, nodeId: string): Promise<NodeResult>;
 }
@@ -286,6 +305,7 @@ interface StoredSnapshot {
 	run: RunView;
 	nodes: StoredNode[];
 	idleLimitMs: number;
+	terminalAt?: number;
 }
 
 interface RunControl {
@@ -301,17 +321,20 @@ interface RunControl {
 /**
  * Creates the public bounded-delegation runtime.
  *
- * The runner and store location are injected so callers can keep execution policy
- * and retention policy outside this small runtime boundary.
+ * The runner is injected for controlled execution; runtime data stays in the
+ * package-owned Pi store unless an isolated test store is supplied.
  */
 export function createSubagentRuntime(options: SubagentRuntimeOptions): SubagentRuntime {
+	const storeDirectory = options.storeDirectory ?? defaultRunStoreDirectory();
 	const runner = options.runner ?? new SubprocessJsonRunner();
 	const executions = new Map<string, Promise<LaunchResult>>();
 	const controls = new Map<string, RunControl>();
 	const clock = options.clock ?? systemClock;
 	const defaultIdleLimitMs = options.idleLimitMs ?? DEFAULT_IDLE_LIMIT_MS;
+	const retentionPeriodMs = options.retentionPeriodMs ?? DEFAULT_RETENTION_PERIOD_MS;
 	const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
 	validatePositiveDuration("Runtime idleLimitMs", defaultIdleLimitMs);
+	validatePositiveDuration("Runtime retentionPeriodMs", retentionPeriodMs);
 	validatePositiveDuration("Runtime terminationGraceMs", terminationGraceMs);
 
 	const prepareNodes = async (graph: NormalizedGraph, parentCwd: string) => {
@@ -338,7 +361,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		preparedNodes: Awaited<ReturnType<typeof prepareNodes>>,
 		snapshot: StoredSnapshot,
 	): Promise<LaunchResult> => {
-		const runDirectory = join(options.storeDirectory, "runs", runId);
+		const runDirectory = join(storeDirectory, "runs", runId);
 		const manifestPath = join(runDirectory, "artifacts.json");
 		const resultPaths = snapshot.nodes.map((node) => join(runDirectory, "artifacts", "nodes", `${node.id}.json`));
 		const indexById = new Map(snapshot.nodes.map((node, index) => [node.id, index]));
@@ -477,7 +500,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			control.active.delete(node.id);
 			activeWork.delete(node.id);
 			armIdleTimer();
-			outcome = withDuration(outcome, clock.now() - startedAt);
+			const usage = resolvedUsage(outcome.usage, prepared.policy, clock.now() - startedAt);
 			let state: NodeResult["state"] = outcome.state;
 			let error = outcome.state === "completed" ? undefined : outcome.error;
 			if (control.affected.has(node.id)) {
@@ -496,12 +519,12 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				? join(runDirectory, "artifacts", "checkpoints", `${node.id}-${randomUUID()}.json`)
 				: resultPaths[index]!;
 			const result: NodeResult = state === "completed"
-				? { state, output: (outcome as Extract<ChildRunnerResult, { state: "completed" }>).output, usage: outcome.usage, policy: prepared.policy }
-				: { state, ...(error ? { error } : {}), usage: outcome.usage, policy: prepared.policy };
+				? { state, output: (outcome as Extract<ChildRunnerResult, { state: "completed" }>).output, usage, policy: prepared.policy }
+				: { state, ...(error ? { error } : {}), usage, policy: prepared.policy };
 			await writeJsonAtomically(resultPath, result);
 			node.resultPath = resultPath;
 			node.artifacts = [...node.artifacts, { kind: state === "completed" ? "result" : state === "suspended" ? "checkpoint" : "failure", path: resultPath }];
-			node.usage = outcome.usage;
+			node.usage = usage;
 			node.state = state;
 			const view = toNodeView(node, result);
 			nodeViews.set(index, view);
@@ -544,11 +567,14 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			? "completed"
 			: finalNodes.some((node) => node.state === "suspended") ? "suspended"
 			: finalNodes.some((node) => node.state === "cancelled") ? "cancelled" : "failed";
+		if (isTerminal(snapshot.run.state)) snapshot.terminalAt ??= clock.now();
 		const graphArtifact: Artifact = { kind: "graph-result", path: join(runDirectory, "artifacts", "graph-result.json") };
 		const artifacts = [...snapshot.nodes.flatMap((node) => node.artifacts), graphArtifact];
 		const finalNode = finalNodes.at(-1)!;
+		const usage = usageTotals(snapshot.nodes);
 		const aggregate: LaunchResult = {
 			run: { ...snapshot.run }, nodes: finalNodes,
+			...(usage ? { usage } : {}),
 			...(finalNode.result?.state === "completed" ? { finalOutput: finalNode.result.output } : {}),
 			trace: finalNodes.map((node, index) => ({ nodeId: node.id, logicalRole: node.logicalRole, state: node.state, predecessorIds: [...preparedNodes[index]!.node.dependencies], ...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}) })),
 			artifacts, handoffs: [...handoffs].sort((left, right) => indexById.get(left.nodeId)! - indexById.get(right.nodeId)!),
@@ -581,7 +607,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const parentCwd = options.cwd ?? process.cwd();
 		const prepared = await prepareNodes(graph, parentCwd);
 		const runId = `run_${randomUUID()}`;
-		const runDirectory = join(options.storeDirectory, "runs", runId);
+		const runDirectory = join(storeDirectory, "runs", runId);
 		const snapshot: StoredSnapshot = {
 			run: { id: runId, state: "running" }, idleLimitMs,
 			nodes: prepared.map(({ node, policy }) => ({ id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] })),
@@ -598,12 +624,12 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 	return {
 		launch,
 		status: async (runId) => {
-			const snapshot = await readSnapshot(options.storeDirectory, runId);
+			const snapshot = await readSnapshot(storeDirectory, runId);
 			const usage = usageTotals(snapshot.nodes);
 			return { run: { ...snapshot.run }, nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })), ...(usage ? { usage } : {}) };
 		},
 		join: async (runId) => {
-			await readSnapshot(options.storeDirectory, runId);
+			await readSnapshot(storeDirectory, runId);
 			const execution = executions.get(runId);
 			if (!execution) throw new Error(`Run is not owned by this runtime: ${runId}`);
 			return execution;
@@ -613,16 +639,16 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			const execution = executions.get(runId);
 			if (!control || !execution) return Promise.reject(new Error(`Run is not owned by this runtime: ${runId}`));
 			if (nodeId === undefined) return control.apply!("cancelling", control.nodeIds).then(() => execution);
-			return readGraph(options.storeDirectory, runId).then((graph) => {
+			return readGraph(storeDirectory, runId).then((graph) => {
 				const nodeIds = descendantNodeIds(graph, nodeId);
 				if (nodeIds.length === 0) throw new Error(`Unknown node: ${nodeId}`);
 				return control.apply!("cancelling", nodeIds).then(() => execution);
 			});
 		},
 		resume: async (runId) => {
-			const snapshot = await readSnapshot(options.storeDirectory, runId);
+			const snapshot = await readSnapshot(storeDirectory, runId);
 			if (snapshot.run.state !== "suspended") throw new Error(`Run is not suspended: ${runId}`);
-			const graph = await readGraph(options.storeDirectory, runId);
+			const graph = await readGraph(storeDirectory, runId);
 			const prepared = await prepareNodes(graph, options.cwd ?? process.cwd());
 			for (const node of snapshot.nodes) {
 				if (node.state !== "completed") {
@@ -632,16 +658,48 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				}
 			}
 			snapshot.run.state = "running";
-			await writeSnapshot(join(options.storeDirectory, "runs", runId), snapshot);
+			await writeSnapshot(join(storeDirectory, "runs", runId), snapshot);
 			return startRun(runId, graph, prepared, snapshot);
 		},
 		dispose: async () => {
 			await Promise.all([...controls.values()].map((control) => control.apply!("suspending", control.nodeIds)));
 			await Promise.all([...executions.values()].map(async (execution) => { await execution; }));
 		},
-		events: async (runId) => readEvents(options.storeDirectory, runId),
+		cleanup: async () => {
+			const runsDirectory = join(storeDirectory, "runs");
+			let runIds: string[];
+			try {
+				runIds = (await readdir(runsDirectory)).sort();
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removedRunIds: [], preservedRunIds: [] };
+				throw error;
+			}
+
+			const removedRunIds: string[] = [];
+			const preservedRunIds: string[] = [];
+			for (const runId of runIds) {
+				if (executions.has(runId) || controls.has(runId)) {
+					preservedRunIds.push(runId);
+					continue;
+				}
+				try {
+					const snapshot = await readSnapshot(storeDirectory, runId);
+					if (!isTerminal(snapshot.run.state) || snapshot.terminalAt === undefined || clock.now() < snapshot.terminalAt + retentionPeriodMs) {
+						preservedRunIds.push(runId);
+						continue;
+					}
+					await rm(join(runsDirectory, runId), { recursive: true, force: true });
+					removedRunIds.push(runId);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					throw error;
+				}
+			}
+			return { removedRunIds, preservedRunIds };
+		},
+		events: async (runId) => readEvents(storeDirectory, runId),
 		result: async (runId, nodeId) => {
-			const snapshot = await readSnapshot(options.storeDirectory, runId);
+			const snapshot = await readSnapshot(storeDirectory, runId);
 			const node = snapshot.nodes.find((candidate) => candidate.id === nodeId);
 			if (!node) throw new Error(`Unknown node: ${nodeId}`);
 			if (!node.resultPath) throw new Error(`Node ${nodeId} has no durable result`);
@@ -670,6 +728,7 @@ function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly
 
 export const DEFAULT_MAX_CONCURRENCY = 6;
 export const DEFAULT_IDLE_LIMIT_MS = 10 * 60 * 1000;
+export const DEFAULT_RETENTION_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_TERMINATION_GRACE_MS = 5_000;
 /** Large handoffs remain complete on disk and enter child context by explicit path. */
 export const MAX_INLINE_HANDOFF_BYTES = 50 * 1024;
@@ -919,20 +978,46 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function withDuration(outcome: ChildRunnerResult, durationMs: number): ChildRunnerResult {
-	return { ...outcome, usage: { ...outcome.usage, durationMs: Math.max(0, durationMs) } };
+function resolvedUsage(
+	providerUsage: UsageRecord | undefined,
+	policy: ExecutionPolicy,
+	durationMs: number,
+): UsageRecord {
+	return {
+		provider: policy.provider,
+		model: policy.model,
+		reasoning: policy.reasoning,
+		inputTokens: suppliedTokenCount(providerUsage?.inputTokens),
+		outputTokens: suppliedTokenCount(providerUsage?.outputTokens),
+		durationMs: Math.max(0, durationMs),
+	};
+}
+
+function suppliedTokenCount(value: TokenUsage | undefined): TokenUsage {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : "unavailable";
 }
 
 function usageTotals(nodes: readonly StoredNode[]): UsageTotals | undefined {
-	const totals: UsageTotals = {};
-	const fields = ["inputTokens", "outputTokens", "durationMs"] as const;
+	const totals: Omit<UsageTotals, "unavailable"> = {};
+	const unavailable = new Set<TokenUsageField>();
 	for (const node of nodes) {
-		for (const field of fields) {
-			const value = node.usage?.[field];
-			if (value !== undefined) totals[field] = (totals[field] ?? 0) + value;
+		const usage = node.usage;
+		if (!usage) continue;
+		for (const field of ["inputTokens", "outputTokens"] as const) {
+			const value = usage[field];
+			if (typeof value === "number") totals[field] = (totals[field] ?? 0) + value;
+			else unavailable.add(field);
 		}
+		if (usage.durationMs !== undefined) totals.durationMs = (totals.durationMs ?? 0) + usage.durationMs;
 	}
-	return Object.keys(totals).length > 0 ? totals : undefined;
+	return Object.keys(totals).length > 0 || unavailable.size > 0
+		? { ...totals, unavailable: [...unavailable].sort() as TokenUsageField[] }
+		: undefined;
+}
+
+function defaultRunStoreDirectory(): string {
+	const piAgentDirectory = process.env.PI_CODING_AGENT_DIR;
+	return join(piAgentDirectory && piAgentDirectory.trim() ? piAgentDirectory : join(homedir(), ".pi", "agent"), "pi-engineering-toolkit");
 }
 
 function freshChildEnvironment(): NodeJS.ProcessEnv {
