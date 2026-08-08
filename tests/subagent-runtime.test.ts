@@ -29,6 +29,16 @@ async function withRuntime<T>(
 	}
 }
 
+async function withStore<T>(test: (storeDirectory: string) => Promise<T>): Promise<T> {
+	const storeDirectory = await mkdtemp(join(tmpdir(), "pi-subagent-runtime-"));
+	try {
+		return await test(storeDirectory);
+	} finally {
+		await rm(storeDirectory, { recursive: true, force: true });
+	}
+}
+
+
 async function withSubprocessRunner<T>(
 	script: string,
 	test: (runner: SubprocessJsonRunner) => Promise<T>,
@@ -108,7 +118,7 @@ describe("subagent runtime", () => {
 		};
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = await runtime.launch(singleNode());
+			const launch = await runtime.launch(singleNode(), { delivery: "blocking" });
 
 			expect(typeof launch.run.id).toBe("string");
 			expect(launch.run.state).toBe("completed");
@@ -153,6 +163,97 @@ describe("subagent runtime", () => {
 		});
 	});
 
+	test("detaches by default, exposes compact progress, joins the durable result, and survives recreation", async () => {
+		let request: ChildRunnerRequest | undefined;
+		let releaseRunner: (() => void) | undefined;
+		const runner: ChildRunner = {
+			run: async (runnerRequest) => {
+				request = runnerRequest;
+				await new Promise<void>((resolve) => { releaseRunner = resolve; });
+				return {
+					state: "completed",
+					output: "Durably finished.",
+					usage: { provider: "test", model: "deterministic", inputTokens: 8, outputTokens: 3 },
+				};
+			},
+		};
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+			});
+			const receipt = await runtime.launch(singleNode());
+
+			expect(receipt).toEqual({ run: { id: expect.stringMatching(/^run_/), state: "running" } });
+			const runningStatus = await runtime.status(receipt.run.id);
+			expect(runningStatus).toMatchObject({
+				run: { id: receipt.run.id, state: "running" },
+				nodes: [{
+					id: request!.nodeId,
+					state: "running",
+					policy: { agent: "worker", provider: "openai", model: "gpt-5.6-luna" },
+					artifacts: [],
+				}],
+			});
+			expect(runningStatus.nodes[0]).not.toHaveProperty("result");
+
+			const joined = runtime.join(receipt.run.id);
+			releaseRunner!();
+			expect(await joined).toMatchObject({
+				run: { id: receipt.run.id, state: "completed" },
+				node: { id: request!.nodeId, result: { state: "completed", output: "Durably finished." } },
+			});
+
+			const settledStatus = await runtime.status(receipt.run.id);
+			expect(settledStatus).toMatchObject({
+				run: { id: receipt.run.id, state: "completed" },
+				usage: { inputTokens: 8, outputTokens: 3, durationMs: expect.any(Number) },
+			});
+			expect(JSON.stringify(settledStatus)).not.toContain("Durably finished.");
+
+			const recreatedRuntime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+			});
+			expect(await recreatedRuntime.status(receipt.run.id)).toEqual(settledStatus);
+		});
+	});
+
+	test("joins detached failures and rejects unknown or inaccessible runs", async () => {
+		const runner: ChildRunner = {
+			run: async () => ({
+				state: "failed",
+				error: { kind: "execution", message: "provider rejected the request" },
+			}),
+		};
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+			});
+			const receipt = await runtime.launch(singleNode());
+
+			await expect(runtime.join(receipt.run.id)).resolves.toMatchObject({
+				run: { id: receipt.run.id, state: "failed" },
+				node: { result: { state: "failed", error: { message: "provider rejected the request" } } },
+			});
+			await expect(runtime.status("run_unknown")).rejects.toThrow("Unknown run: run_unknown");
+			await expect(runtime.join("run_unknown")).rejects.toThrow("Unknown run: run_unknown");
+
+			const recreatedRuntime = createSubagentRuntime({
+				storeDirectory,
+				runner,
+				modelCatalog: { isAvailable: () => true },
+			});
+			await expect(recreatedRuntime.join(receipt.run.id)).rejects.toThrow(`Run is not owned by this runtime: ${receipt.run.id}`);
+		});
+	});
+
 	test("resolves the project definition and isolates per-node policy overrides", async () => {
 		const definitionsDirectory = await mkdtemp(join(tmpdir(), "pi-agent-definitions-"));
 		const childDirectory = join(definitionsDirectory, "child-worktree");
@@ -173,7 +274,7 @@ describe("subagent runtime", () => {
 			await writeDefinition(project, "worker", { provider: "project", model: "project-model", reasoning: "high", tools: "read" });
 
 			await withRuntime(runner, async (runtime) => {
-				await runtime.launch({ nodes: [{ agent: "worker", logicalRole: "Inspect", task: "Inspect the repository", cwd: childDirectory }] });
+				await runtime.launch({ nodes: [{ agent: "worker", logicalRole: "Inspect", task: "Inspect the repository", cwd: childDirectory }] }, { delivery: "blocking" });
 				await runtime.launch({
 					nodes: [{
 						agent: "worker",
@@ -185,9 +286,9 @@ describe("subagent runtime", () => {
 						reasoning: "medium",
 						tools: ["bash"],
 					}],
-				});
+				}, { delivery: "blocking" });
 				await rm(join(project, "worker.md"));
-				await runtime.launch({ nodes: [{ agent: "worker", logicalRole: "Inspect", task: "Inspect the repository", cwd: childDirectory }] });
+				await runtime.launch({ nodes: [{ agent: "worker", logicalRole: "Inspect", task: "Inspect the repository", cwd: childDirectory }] }, { delivery: "blocking" });
 			}, {
 				definitionDirectories: { packaged, user, project },
 				modelCatalog: { isAvailable: async () => true },
@@ -289,7 +390,7 @@ describe("subagent runtime", () => {
 		try {
 			await withRuntime(runner, async (runtime) => {
 				for (const [agent, logicalRole] of definitions) {
-					await runtime.launch({ nodes: [{ agent, logicalRole, task: "Perform the bounded task" }] });
+					await runtime.launch({ nodes: [{ agent, logicalRole, task: "Perform the bounded task" }] }, { delivery: "blocking" });
 				}
 			}, { definitionDirectories: { user: isolatedDirectories, project: isolatedDirectories } });
 		} finally {
@@ -328,7 +429,7 @@ describe("subagent runtime", () => {
 		const graph = { nodes: [{ agent: "worker", logicalRole: "Recon", task: "Inspect", tools: ["isolated-tool"] }] };
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = runtime.launch(graph);
+			const launch = runtime.launch(graph, { delivery: "blocking" });
 			await started;
 			graph.nodes[0]!.tools.push("leaked-tool");
 			releaseRunner!();
@@ -343,14 +444,13 @@ describe("subagent runtime", () => {
 		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "" }) };
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = await runtime.launch(singleNode());
+			const launch = await runtime.launch(singleNode(), { delivery: "blocking" });
 			const result = await runtime.result(launch.run.id, launch.node.id);
 
 			expect(launch.node.state).toBe("completed");
 			expect(result).toMatchObject({ state: "completed", output: "" });
 		});
 	});
-
 	test("returns failed status with durable error evidence", async () => {
 		const runner: ChildRunner = {
 			run: async () => ({
@@ -360,7 +460,7 @@ describe("subagent runtime", () => {
 		};
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = await runtime.launch(singleNode());
+			const launch = await runtime.launch(singleNode(), { delivery: "blocking" });
 			const result = await runtime.result(launch.run.id, launch.node.id);
 
 			expect(launch.run.state).toBe("failed");
@@ -387,7 +487,7 @@ describe("subagent runtime", () => {
 		};
 
 		await withRuntime(runner, async (runtime) => {
-			const launch = runtime.launch(singleNode());
+			const launch = runtime.launch(singleNode(), { delivery: "blocking" });
 			await started;
 			expect((await runtime.status(request!.runId)).run.state).toBe("running");
 

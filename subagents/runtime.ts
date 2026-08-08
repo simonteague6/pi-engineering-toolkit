@@ -117,9 +117,25 @@ export interface LaunchResult {
 	node: NodeView;
 }
 
+export interface LaunchReceipt {
+	run: RunView;
+}
+
+export interface LaunchOptions {
+	/** Detached execution is the default; blocking returns the terminal node result. */
+	delivery?: "detached" | "blocking";
+}
+
+export interface UsageTotals {
+	inputTokens?: number;
+	outputTokens?: number;
+	durationMs?: number;
+}
+
 export interface StatusView {
 	run: RunView;
 	nodes: Array<Omit<NodeView, "result">>;
+	usage?: UsageTotals;
 }
 
 export interface ModelCatalog {
@@ -137,8 +153,12 @@ export interface SubagentRuntimeOptions {
 
 /** Stable public operations; storage files and process details remain private. */
 export interface SubagentRuntime {
-	launch(graph: SingleNodeGraph): Promise<LaunchResult>;
+	launch(graph: SingleNodeGraph): Promise<LaunchReceipt>;
+	launch(graph: SingleNodeGraph, options: { delivery: "blocking" }): Promise<LaunchResult>;
+	launch(graph: SingleNodeGraph, options: { delivery: "detached" }): Promise<LaunchReceipt>;
+	launch(graph: SingleNodeGraph, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
+	join(runId: string): Promise<LaunchResult>;
 	result(runId: string, nodeId: string): Promise<NodeResult>;
 }
 
@@ -166,51 +186,55 @@ interface StoredSnapshot {
  */
 export function createSubagentRuntime(options: SubagentRuntimeOptions): SubagentRuntime {
 	const runner = options.runner ?? new SubprocessJsonRunner();
+	const ownedDetachedRuns = new Map<string, Promise<LaunchResult>>();
 
-	return {
-		launch: async (graph: SingleNodeGraph): Promise<LaunchResult> => {
-			if (graph.nodes.length !== 1) {
-				throw new Error("This runtime slice accepts exactly one node");
-			}
+	const launch = (async (
+		graph: SingleNodeGraph,
+		launchOptions?: LaunchOptions,
+	): Promise<LaunchReceipt | LaunchResult> => {
+		if (graph.nodes.length !== 1) {
+			throw new Error("This runtime slice accepts exactly one node");
+		}
 
-			const definition = immutableNodeDefinition(graph.nodes[0]!);
-			if (!definition.agent.trim()) throw new Error("Node agent must not be empty");
-			if (!definition.logicalRole.trim()) throw new Error("Node logicalRole must not be empty");
-			if (!definition.task.trim()) throw new Error("Node task must not be empty");
+		const definition = immutableNodeDefinition(graph.nodes[0]!);
+		if (!definition.agent.trim()) throw new Error("Node agent must not be empty");
+		if (!definition.logicalRole.trim()) throw new Error("Node logicalRole must not be empty");
+		if (!definition.task.trim()) throw new Error("Node task must not be empty");
 
-			const agentDefinition = await resolveAgentDefinition(
-				definition.agent,
-				configuredDefinitionDirectories(options.cwd ?? process.cwd(), options.definitionDirectories),
-			);
-			if (agentDefinition.id !== definition.agent) {
-				throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
-			}
-			const policy = resolveExecutionPolicy(definition, agentDefinition, options.cwd ?? process.cwd());
-			if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
-				throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
-			}
+		const agentDefinition = await resolveAgentDefinition(
+			definition.agent,
+			configuredDefinitionDirectories(options.cwd ?? process.cwd(), options.definitionDirectories),
+		);
+		if (agentDefinition.id !== definition.agent) {
+			throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
+		}
+		const policy = resolveExecutionPolicy(definition, agentDefinition, options.cwd ?? process.cwd());
+		if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
+			throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
+		}
 
-			const runId = `run_${randomUUID()}`;
-			const nodeId = `node_${randomUUID()}`;
-			const runDirectory = join(options.storeDirectory, "runs", runId);
-			const resultPath = join(runDirectory, "artifacts", `${nodeId}.json`);
-			const manifestPath = join(runDirectory, "artifacts.json");
-			const node: StoredNode = {
-				id: nodeId,
-				agent: definition.agent,
-				logicalRole: definition.logicalRole,
-				state: "queued",
-				policy,
-				artifacts: [],
-			};
-			const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes: [node] };
+		const runId = `run_${randomUUID()}`;
+		const nodeId = `node_${randomUUID()}`;
+		const runDirectory = join(options.storeDirectory, "runs", runId);
+		const resultPath = join(runDirectory, "artifacts", `${nodeId}.json`);
+		const manifestPath = join(runDirectory, "artifacts.json");
+		const node: StoredNode = {
+			id: nodeId,
+			agent: definition.agent,
+			logicalRole: definition.logicalRole,
+			state: "queued",
+			policy,
+			artifacts: [],
+		};
+		const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes: [node] };
 
-			await writeJsonAtomically(join(runDirectory, "graph.json"), { nodes: [definition] });
-			await writeSnapshot(runDirectory, snapshot);
-			snapshot.run.state = "running";
-			node.state = "running";
-			await writeSnapshot(runDirectory, snapshot);
+		await writeJsonAtomically(join(runDirectory, "graph.json"), { nodes: [definition] });
+		await writeSnapshot(runDirectory, snapshot);
+		snapshot.run.state = "running";
+		node.state = "running";
+		await writeSnapshot(runDirectory, snapshot);
 
+		const execution = (async (): Promise<LaunchResult> => {
 			const startedAt = Date.now();
 			let outcome: ChildRunnerResult;
 			try {
@@ -254,14 +278,34 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			await writeSnapshot(runDirectory, snapshot);
 
 			return { run: { ...snapshot.run }, node: toNodeView(node, result) };
-		},
+		})();
+
+		if (launchOptions?.delivery === "blocking") return execution;
+
+		ownedDetachedRuns.set(runId, execution);
+		// Detached callers may never join; retain rejection handling for storage failures.
+		void execution.catch(() => undefined);
+		return { run: { ...snapshot.run } };
+	}) as SubagentRuntime["launch"];
+
+	return {
+		launch,
 
 		status: async (runId: string): Promise<StatusView> => {
 			const snapshot = await readSnapshot(options.storeDirectory, runId);
+			const usage = usageTotals(snapshot.nodes);
 			return {
 				run: { ...snapshot.run },
 				nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })),
+				...(usage ? { usage } : {}),
 			};
+		},
+
+		join: async (runId: string): Promise<LaunchResult> => {
+			await readSnapshot(options.storeDirectory, runId);
+			const execution = ownedDetachedRuns.get(runId);
+			if (!execution) throw new Error(`Run is not owned by this runtime: ${runId}`);
+			return execution;
 		},
 
 		result: async (runId: string, nodeId: string): Promise<NodeResult> => {
@@ -392,6 +436,18 @@ function errorMessage(error: unknown): string {
 
 function withDuration(outcome: ChildRunnerResult, durationMs: number): ChildRunnerResult {
 	return { ...outcome, usage: { ...outcome.usage, durationMs: Math.max(0, durationMs) } };
+}
+
+function usageTotals(nodes: readonly StoredNode[]): UsageTotals | undefined {
+	const totals: UsageTotals = {};
+	const fields = ["inputTokens", "outputTokens", "durationMs"] as const;
+	for (const node of nodes) {
+		for (const field of fields) {
+			const value = node.usage?.[field];
+			if (value !== undefined) totals[field] = (totals[field] ?? 0) + value;
+		}
+	}
+	return Object.keys(totals).length > 0 ? totals : undefined;
 }
 
 function freshChildEnvironment(): NodeJS.ProcessEnv {
