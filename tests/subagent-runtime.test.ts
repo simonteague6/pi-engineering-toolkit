@@ -931,6 +931,86 @@ describe("subagent runtime", () => {
 		});
 	});
 
+	test("recovers failed roles in a new lineage while reusing successful artifacts", async () => {
+		const requests: ChildRunnerRequest[] = [];
+		let recovering = false;
+		const runner: ChildRunner = {
+			run: async (request) => {
+				requests.push(request);
+				if (request.logicalRole === "Retry" && !recovering) {
+					return { state: "failed", error: { kind: "execution", message: "provider failed", partialOutput: "failed private work" } };
+				}
+				return { state: "completed", output: `${request.logicalRole} result` };
+			},
+		};
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			const failed = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "research", agent: "worker", logicalRole: "Research", task: "Research the repository." },
+					{ id: "retry", agent: "worker", logicalRole: "Retry", task: "Retry the investigation." },
+					{ id: "unaffected", agent: "worker", logicalRole: "Unaffected", task: "Keep this evidence." },
+					{ id: "synthesis", agent: "worker", logicalRole: "Synthesis", task: "Synthesize the evidence.", dependsOn: ["research", "retry"] },
+				],
+			}, { delivery: "blocking" });
+			expect(failed.run.state).toBe("failed");
+			expect(requests.map((request) => request.logicalRole)).toEqual(["Research", "Retry", "Unaffected"]);
+
+			recovering = true;
+			const recreatedRuntime = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			const recovered = await recreatedRuntime.recover(failed.run.id, {
+				replacements: [{
+					logicalRole: "Retry",
+					correction: "Use a separate approach.",
+					artifacts: ["/tmp/requirements.md"],
+					acceptanceConditions: "Return cited findings.",
+					model: "recovery-model",
+				}],
+			}, { delivery: "blocking" });
+
+			expect(recovered.run.id).not.toBe(failed.run.id);
+			expect(recovered.run).toMatchObject({
+				state: "completed",
+				lineage: {
+					sourceRunId: failed.run.id,
+					originalRunId: failed.run.id,
+					graphDefinitionRunId: failed.run.id,
+					replacedLogicalRoles: ["Retry"],
+				},
+			});
+			expect(recovered.nodes.map((node) => node.state)).toEqual(["completed", "completed", "completed", "completed"]);
+			expect(recovered.nodes[0]!.result).toMatchObject({ output: "Research result" });
+			expect(recovered.nodes[2]!.result).toMatchObject({ output: "Unaffected result" });
+			expect(requests.slice(3).map((request) => request.logicalRole)).toEqual(["Retry", "Synthesis"]);
+			expect(requests[3]).toMatchObject({
+				model: "recovery-model",
+				task: "Retry the investigation.\n\n## Recovery correction\nUse a separate approach.\n\n## Additional recovery artifacts\n- /tmp/requirements.md\n\n## Recovery acceptance conditions\nReturn cited findings.",
+			});
+			expect(requests[3]!.task).not.toContain("failed private work");
+			expect(requests[4]!.task).toBe("Synthesize the evidence.\n\n## Output from research\nResearch result\n\n## Output from retry\nRetry result");
+			expect((await runtime.status(failed.run.id)).run.state).toBe("failed");
+			expect(await recreatedRuntime.status(recovered.run.id)).toMatchObject({ run: { lineage: { sourceRunId: failed.run.id } } });
+		});
+	});
+
+	test("rejects cancelled and completed runs as recovery sources", async () => {
+		const runner: ChildRunner = {
+			run: async (request) => request.logicalRole === "Cancelled"
+				? { state: "cancelled", error: { kind: "cancelled", message: "stopped" } }
+				: { state: "completed", output: "done" },
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const cancelled = await runtime.launch({ kind: "single", node: { agent: "worker", logicalRole: "Cancelled", task: "Stop." } }, { delivery: "blocking" });
+			const completed = await runtime.launch(singleNode(), { delivery: "blocking" });
+
+			await expect(runtime.recover(cancelled.run.id, { replacements: [{ logicalRole: "Cancelled" }] })).rejects.toThrow("Recovery requires a failed run");
+			await expect(runtime.recover(completed.run.id, { replacements: [{ logicalRole: "Recon" }] })).rejects.toThrow("Recovery requires a failed run");
+		});
+	});
+
 	test("returns failed status with durable error evidence", async () => {
 		const runner: ChildRunner = {
 			run: async () => ({

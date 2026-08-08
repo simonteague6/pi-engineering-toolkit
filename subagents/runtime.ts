@@ -49,6 +49,32 @@ export interface NodeDefinition {
 	tools?: readonly string[];
 }
 
+/** Parent-selected changes for one failed logical role in a recovery run. */
+export interface RecoveryReplacement {
+	readonly logicalRole: string;
+	readonly correction?: string;
+	readonly artifacts?: readonly string[];
+	readonly acceptanceConditions?: string;
+	readonly agent?: string;
+	readonly cwd?: string;
+	readonly provider?: string;
+	readonly model?: string;
+	readonly reasoning?: ReasoningLevel;
+	readonly tools?: readonly string[];
+}
+
+export interface RecoveryPlan {
+	readonly replacements: readonly RecoveryReplacement[];
+}
+
+/** Immutable ancestry and replacement evidence for a recovery run. */
+export interface RecoveryLineage {
+	readonly sourceRunId: string;
+	readonly originalRunId: string;
+	readonly graphDefinitionRunId: string;
+	readonly replacedLogicalRoles: readonly string[];
+}
+
 /** Public ergonomic form for exactly one child node. */
 export interface SingleGraph {
 	readonly kind: "single";
@@ -187,6 +213,7 @@ export interface NodeTrace {
 export interface RunView {
 	id: string;
 	state: LifecycleState;
+	lineage?: RecoveryLineage;
 }
 
 /** Terminal aggregate in declaration order with durable graph evidence. */
@@ -281,6 +308,11 @@ export interface SubagentRuntime {
 	cancel(runId: string, nodeId?: string): Promise<LaunchResult>;
 	/** Restarts a suspended run from its durable graph and evidence only. */
 	resume(runId: string): Promise<LaunchResult>;
+	/** Creates a new run that replaces failed roles and reuses unaffected durable work. */
+	recover(runId: string, plan: RecoveryPlan): Promise<LaunchReceipt>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "blocking" }): Promise<LaunchResult>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "detached" }): Promise<LaunchReceipt>;
+	recover(runId: string, plan: RecoveryPlan, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	/** Gracefully suspends runtime-owned active runs. */
 	dispose(): Promise<void>;
 	/** Removes expired terminal run data while preserving non-terminal runs. */
@@ -533,6 +565,13 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			return view;
 		};
 
+		for (let index = 0; index < snapshot.nodes.length; index += 1) {
+			const node = snapshot.nodes[index]!;
+			if (node.state !== "completed" || !node.resultPath) continue;
+			const result = JSON.parse(await readFile(node.resultPath, "utf8")) as NodeResult;
+			if (result.state !== "completed") throw new Error(`Unusable durable result for completed node ${node.id}`);
+			nodeViews.set(index, toNodeView(node, result));
+		}
 		for (const node of snapshot.nodes) {
 			if (node.state === "queued") void record("queued", node.id);
 		}
@@ -621,6 +660,55 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		return { run: { ...snapshot.run } };
 	}) as SubagentRuntime["launch"];
 
+	const recover = (async (sourceRunId: string, plan: RecoveryPlan, launchOptions?: LaunchOptions): Promise<LaunchReceipt | LaunchResult> => {
+		const sourceSnapshot = await readSnapshot(storeDirectory, sourceRunId);
+		if (sourceSnapshot.run.state !== "failed") throw new Error(`Recovery requires a failed run: ${sourceRunId}`);
+		const graph = await readGraph(storeDirectory, sourceRunId);
+		const replacementByRole = recoveryReplacements(plan, sourceSnapshot, graph);
+		const affectedNodeIds = new Set<string>();
+		for (const node of graph.nodes) {
+			if (replacementByRole.has(node.definition.logicalRole)) {
+				for (const nodeId of descendantNodeIds(graph, node.id)) affectedNodeIds.add(nodeId);
+			}
+		}
+		const recoveryGraph = graphWithRecoveryReplacements(graph, replacementByRole);
+		const idleLimitMs = launchOptions?.idleLimitMs ?? defaultIdleLimitMs;
+		validatePositiveDuration("Run idleLimitMs", idleLimitMs);
+		effectiveConcurrencyLimit(options.maxConcurrency, graph.maxConcurrency);
+		const prepared = await prepareNodes(recoveryGraph, options.cwd ?? process.cwd());
+		const runId = `run_${randomUUID()}`;
+		const lineage: RecoveryLineage = {
+			sourceRunId,
+			originalRunId: sourceSnapshot.run.lineage?.originalRunId ?? sourceRunId,
+			graphDefinitionRunId: sourceSnapshot.run.lineage?.graphDefinitionRunId ?? sourceRunId,
+			replacedLogicalRoles: [...replacementByRole.keys()],
+		};
+		const sourceById = new Map(sourceSnapshot.nodes.map((node) => [node.id, node]));
+		const snapshot: StoredSnapshot = {
+			run: { id: runId, state: "running", lineage },
+			idleLimitMs,
+			nodes: prepared.map(({ node, policy }) => {
+				const sourceNode = sourceById.get(node.id)!;
+				if (!affectedNodeIds.has(node.id) && sourceNode.state === "completed") {
+					return {
+						...sourceNode,
+						artifacts: [...sourceNode.artifacts],
+						...(sourceNode.blockedBy ? { blockedBy: [...sourceNode.blockedBy] } : {}),
+					};
+				}
+				return { id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] };
+			}),
+		};
+		const runDirectory = join(storeDirectory, "runs", runId);
+		await writeJsonAtomically(join(runDirectory, "graph.json"), graph);
+		await writeJsonAtomically(join(runDirectory, "recovery.json"), { lineage, plan });
+		await writeSnapshot(runDirectory, snapshot);
+		const execution = startRun(runId, recoveryGraph, prepared, snapshot);
+		if (launchOptions?.delivery === "blocking") return execution;
+		await writeSnapshot(runDirectory, snapshot);
+		return { run: { ...snapshot.run } };
+	}) as SubagentRuntime["recover"];
+
 	return {
 		launch,
 		status: async (runId) => {
@@ -661,6 +749,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			await writeSnapshot(join(storeDirectory, "runs", runId), snapshot);
 			return startRun(runId, graph, prepared, snapshot);
 		},
+		recover,
 		dispose: async () => {
 			await Promise.all([...controls.values()].map((control) => control.apply!("suspending", control.nodeIds)));
 			await Promise.all([...executions.values()].map(async (execution) => { await execution; }));
@@ -707,6 +796,86 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		},
 	};
 }
+
+function recoveryReplacements(
+	plan: RecoveryPlan,
+	sourceSnapshot: StoredSnapshot,
+	graph: NormalizedGraph,
+): Map<string, RecoveryReplacement> {
+	if (!Array.isArray(plan.replacements) || plan.replacements.length === 0) {
+		throw new Error("Recovery requires at least one replacement");
+	}
+	const graphNodesByRole = new Map<string, NormalizedNode[]>();
+	for (const node of graph.nodes) {
+		const nodes = graphNodesByRole.get(node.definition.logicalRole) ?? [];
+		nodes.push(node);
+		graphNodesByRole.set(node.definition.logicalRole, nodes);
+	}
+	const replacements = new Map<string, RecoveryReplacement>();
+	for (const replacement of plan.replacements) {
+		if (!replacement.logicalRole?.trim()) throw new Error("Recovery replacement logicalRole must not be empty");
+		if (replacements.has(replacement.logicalRole)) throw new Error(`Duplicate recovery replacement: ${replacement.logicalRole}`);
+		if (graphNodesByRole.get(replacement.logicalRole)?.length !== 1) {
+			throw new Error(`Recovery logical role must identify exactly one node: ${replacement.logicalRole}`);
+		}
+		validateRecoveryText(replacement.correction, "Recovery correction");
+		validateRecoveryText(replacement.acceptanceConditions, "Recovery acceptance conditions");
+		for (const artifact of replacement.artifacts ?? []) validateRecoveryText(artifact, "Recovery artifact path");
+		replacements.set(replacement.logicalRole, replacement);
+	}
+	const sourceById = new Map(sourceSnapshot.nodes.map((node) => [node.id, node]));
+	const failedRoles: string[] = [];
+	for (const node of graph.nodes) {
+		const sourceNode = sourceById.get(node.id);
+		if (!sourceNode) throw new Error(`Recovery source is missing node evidence: ${node.id}`);
+		if (sourceNode.state === "failed") failedRoles.push(node.definition.logicalRole);
+	}
+	for (const role of failedRoles) {
+		if (!replacements.has(role)) throw new Error(`Recovery must replace every failed logical role: ${role}`);
+	}
+	for (const role of replacements.keys()) {
+		const node = graphNodesByRole.get(role)![0]!;
+		if (sourceById.get(node.id)!.state !== "failed") {
+			throw new Error(`Recovery replacement is not failed: ${role}`);
+		}
+	}
+	return replacements;
+}
+
+function validateRecoveryText(value: string | undefined, label: string): void {
+	if (value !== undefined && !value.trim()) throw new Error(`${label} must not be empty`);
+}
+
+function graphWithRecoveryReplacements(
+	graph: NormalizedGraph,
+	replacements: ReadonlyMap<string, RecoveryReplacement>,
+): NormalizedGraph {
+	const nodes = graph.nodes.map((node) => {
+		const replacement = replacements.get(node.definition.logicalRole);
+		if (!replacement) return node;
+		const definition: NodeDefinition = {
+			agent: replacement.agent ?? node.definition.agent,
+			logicalRole: node.definition.logicalRole,
+			task: recoveryTask(node.definition.task, replacement),
+			cwd: replacement.cwd ?? node.definition.cwd,
+			provider: replacement.provider ?? node.definition.provider,
+			model: replacement.model ?? node.definition.model,
+			reasoning: replacement.reasoning ?? node.definition.reasoning,
+			tools: replacement.tools ?? node.definition.tools,
+		};
+		return Object.freeze({ ...node, definition: immutableNodeDefinition(definition) });
+	});
+	return Object.freeze({ nodes: Object.freeze(nodes), ...(graph.maxConcurrency === undefined ? {} : { maxConcurrency: graph.maxConcurrency }) });
+}
+
+function recoveryTask(task: string, replacement: RecoveryReplacement): string {
+	const sections = [task];
+	if (replacement.correction !== undefined) sections.push(`## Recovery correction\n${replacement.correction}`);
+	if (replacement.artifacts?.length) sections.push(`## Additional recovery artifacts\n${replacement.artifacts.map((artifact) => `- ${artifact}`).join("\n")}`);
+	if (replacement.acceptanceConditions !== undefined) sections.push(`## Recovery acceptance conditions\n${replacement.acceptanceConditions}`);
+	return sections.join("\n\n");
+}
+
 const systemClock: RuntimeClock = {
 	now: () => Date.now(),
 	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
