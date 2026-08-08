@@ -985,6 +985,166 @@ describe("subagent runtime", () => {
 	});
 });
 
+class FakeClock {
+	private nowMs = 0;
+	private nextId = 0;
+	private readonly timers = new Map<number, { at: number; callback: () => void }>();
+
+	now(): number { return this.nowMs; }
+
+	setTimeout(callback: () => void, delayMs: number): number {
+		const id = this.nextId++;
+		this.timers.set(id, { at: this.nowMs + delayMs, callback });
+		return id;
+	}
+
+	clearTimeout(id: unknown): void { this.timers.delete(id as number); }
+
+	advance(ms: number): void {
+		this.nowMs += ms;
+		for (const [id, timer] of [...this.timers]) {
+			if (timer.at <= this.nowMs) {
+				this.timers.delete(id);
+				timer.callback();
+			}
+		}
+	}
+}
+
+describe("run control", () => {
+	test("cancels active and queued nodes durably", async () => {
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const running = new Promise<void>((resolve) => { started = resolve; });
+		const runner: ChildRunner = {
+			run: async (_request, options) => {
+				started!();
+				await new Promise<void>((resolve) => { release = resolve; });
+				return options?.signal?.aborted
+					? { state: "cancelled", error: { kind: "cancelled", message: "stopped" } }
+					: { state: "completed", output: "unexpected" };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = runtime.launch({
+				kind: "chain",
+				nodes: [
+					{ agent: "worker", logicalRole: "Active", task: "Work." },
+					{ agent: "worker", logicalRole: "Queued descendant", task: "Never start." },
+				],
+			});
+			await running;
+			const cancellation = runtime.cancel((await launch).run.id);
+			release!();
+			const result = await cancellation;
+
+			expect(result.run.state).toBe("cancelled");
+			expect(result.nodes.map((node) => node.state)).toEqual(["cancelled", "cancelled"]);
+			expect(await runtime.result(result.run.id, "node-2")).toMatchObject({
+				state: "cancelled",
+				error: { kind: "cancelled" },
+			});
+			expect((await runtime.events(result.run.id)).some((event) => event.state === "cancelled")).toBe(true);
+		});
+	});
+
+	test("cancels one node and its descendants while unrelated siblings continue", async () => {
+		const runner: ChildRunner = {
+			run: async (request, options) => {
+				if (request.logicalRole === "Cancel") {
+					await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+					return { state: "cancelled", error: { kind: "cancelled", message: "stopped" } };
+				}
+				return { state: "completed", output: "unrelated evidence" };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const receipt = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "cancel", agent: "worker", logicalRole: "Cancel", task: "Stop." },
+					{ id: "descendant", agent: "worker", logicalRole: "Descendant", task: "Never run.", dependsOn: ["cancel"] },
+					{ id: "sibling", agent: "worker", logicalRole: "Sibling", task: "Continue." },
+				],
+			});
+			const result = await runtime.cancel(receipt.run.id, "cancel");
+
+			expect(result.nodes.map((node) => node.state)).toEqual(["cancelled", "cancelled", "completed"]);
+			expect(result.nodes[2]!.result).toMatchObject({ output: "unrelated evidence" });
+		});
+	});
+
+	test("disposal suspends a run and recreation requires explicit resume", async () => {
+		let releaseFirst: (() => void) | undefined;
+		let firstStarted: (() => void) | undefined;
+		const firstRunStarted = new Promise<void>((resolve) => { firstStarted = resolve; });
+		let calls = 0;
+		const runner: ChildRunner = {
+			run: async (_request, options) => {
+				calls += 1;
+				if (calls === 1) {
+					firstStarted!();
+					await new Promise<void>((resolve) => { releaseFirst = resolve; });
+					if (options?.signal?.aborted) return { state: "cancelled", error: { kind: "cancelled", message: "suspended" } };
+				}
+				return { state: "completed", output: "durable after resume" };
+			},
+		};
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			const receipt = await runtime.launch(singleNode());
+			await firstRunStarted;
+			const dispose = runtime.dispose();
+			releaseFirst!();
+			await dispose;
+			expect((await runtime.status(receipt.run.id)).run.state).toBe("suspended");
+
+			const recreated = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			expect((await recreated.status(receipt.run.id)).run.state).toBe("suspended");
+			const resumed = await recreated.resume(receipt.run.id);
+			expect(resumed.run).toMatchObject({ id: receipt.run.id, state: "completed" });
+			expect(resumed.nodes[0]!.result).toMatchObject({ output: "durable after resume" });
+			expect(resumed.nodes[0]!.artifacts.map((artifact) => artifact.kind)).toEqual(["checkpoint", "result"]);
+		});
+	});
+
+	test("fails stalled work at its per-run idle limit without timing active work out", async () => {
+		const clock = new FakeClock();
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const runnerStarted = new Promise<void>((resolve) => { started = resolve; });
+		const runner: ChildRunner = {
+			run: async (_request, options) => {
+				started!();
+				options?.onActivityChange?.(false);
+				await new Promise<void>((resolve) => { release = resolve; });
+				return options?.signal?.aborted
+					? { state: "cancelled", error: { kind: "cancelled", message: "idle stop" } }
+					: { state: "completed", output: "unexpected" };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const execution = runtime.launch(singleNode(), { delivery: "blocking", idleLimitMs: 20 });
+			await runnerStarted;
+			clock.advance(19);
+			await Promise.resolve();
+			clock.advance(1);
+			release!();
+			const result = await execution;
+
+			expect(result.run.state).toBe("failed");
+			expect(result.nodes[0]!.result).toMatchObject({
+				state: "failed",
+				error: { kind: "timeout" },
+			});
+		}, { clock });
+	});
+});
+
 describe("subprocess JSON runner", () => {
 	test("parses settled JSONL output, usage, and duration", async () => {
 		await withSubprocessRunner(`
@@ -1020,6 +1180,26 @@ describe("subprocess JSON runner", () => {
 				state: "cancelled",
 				error: { kind: "cancelled", message: "Pi stopped before settlement", partialOutput: "partial" },
 			});
+		});
+	});
+
+	test("requests graceful termination then force-terminates an unresponsive child", async () => {
+		await withSubprocessRunner(`
+			console.log(JSON.stringify({ type: "agent_start" }));
+			process.on("SIGTERM", () => {});
+			setInterval(() => {}, 1_000);
+		`, async (runner) => {
+			const controller = new AbortController();
+			const result = await Promise.race([
+				runner.run(childRequest(), {
+					signal: controller.signal,
+					terminationGraceMs: 20,
+					onActivityChange: (active) => { if (active) controller.abort(); },
+				}),
+				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("child did not terminate")), 1_000)),
+			]);
+
+			expect(result).toMatchObject({ state: "cancelled", error: { kind: "cancelled" } });
 		});
 	});
 

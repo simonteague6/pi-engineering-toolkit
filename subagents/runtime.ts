@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	defaultDefinitionDirectories,
@@ -21,12 +21,12 @@ export interface UsageRecord {
 }
 
 export interface Artifact {
-	kind: "result" | "failure" | "handoff" | "graph-result";
+	kind: "result" | "failure" | "checkpoint" | "handoff" | "graph-result";
 	path: string;
 }
 
 export interface FailureEvidence {
-	kind: "startup" | "stream" | "execution" | "cancelled";
+	kind: "startup" | "stream" | "execution" | "cancelled" | "timeout";
 	message: string;
 	stderr?: string;
 	partialOutput?: string;
@@ -115,8 +115,17 @@ export type ChildRunnerResult =
 	| { state: "cancelled"; error?: FailureEvidence; usage?: UsageRecord };
 
 /** Executes one fresh child without exposing its process protocol to callers. */
+export interface ChildRunnerOptions {
+	/** Requests graceful child termination. */
+	readonly signal?: AbortSignal;
+	/** The runner must escalate after this grace period when it owns a process. */
+	readonly terminationGraceMs?: number;
+	/** Reports whether the child currently has active provider or tool work. */
+	readonly onActivityChange?: (active: boolean) => void;
+}
+
 export interface ChildRunner {
-	run(request: ChildRunnerRequest): Promise<ChildRunnerResult>;
+	run(request: ChildRunnerRequest, options?: ChildRunnerOptions): Promise<ChildRunnerResult>;
 }
 
 export interface ExecutionPolicy {
@@ -133,7 +142,7 @@ export interface ExecutionPolicy {
 }
 
 export interface NodeResult {
-	state: "completed" | "failed" | "cancelled";
+	state: "completed" | "failed" | "cancelled" | "suspended";
 	output?: string;
 	error?: FailureEvidence;
 	usage?: UsageRecord;
@@ -192,6 +201,22 @@ export interface LaunchReceipt {
 export interface LaunchOptions {
 	/** Detached execution is the default; blocking returns the terminal node result. */
 	delivery?: "detached" | "blocking";
+	/** Time with no active provider or tool work. Defaults to ten minutes. */
+	idleLimitMs?: number;
+}
+
+export interface LifecycleEvent {
+	runId: string;
+	state: LifecycleState;
+	nodeId?: string;
+	reason?: "cancelled" | "suspended" | "timeout";
+	at: number;
+}
+
+export interface RuntimeClock {
+	now(): number;
+	setTimeout(callback: () => void, delayMs: number): unknown;
+	clearTimeout(timer: unknown): void;
 }
 
 export interface UsageTotals {
@@ -219,6 +244,12 @@ export interface SubagentRuntimeOptions {
 	modelCatalog: ModelCatalog;
 	/** User-owned active-child ceiling; defaults to six. */
 	maxConcurrency?: number;
+	/** Default time with no active provider or tool work; defaults to ten minutes. */
+	idleLimitMs?: number;
+	/** Grace period before a subprocess runner force-terminates a child. */
+	terminationGraceMs?: number;
+	/** Injectable clock for deterministic lifecycle tests. */
+	clock?: RuntimeClock;
 }
 
 /** Stable public operations; storage files and process details remain private. */
@@ -229,6 +260,13 @@ export interface SubagentRuntime {
 	launch(graph: GraphDefinition, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
 	join(runId: string): Promise<LaunchResult>;
+	/** Cancels a whole run, or one node and its descendants. */
+	cancel(runId: string, nodeId?: string): Promise<LaunchResult>;
+	/** Restarts a suspended run from its durable graph and evidence only. */
+	resume(runId: string): Promise<LaunchResult>;
+	/** Gracefully suspends runtime-owned active runs. */
+	dispose(): Promise<void>;
+	events(runId: string): Promise<LifecycleEvent[]>;
 	result(runId: string, nodeId: string): Promise<NodeResult>;
 }
 
@@ -247,6 +285,17 @@ interface StoredNode {
 interface StoredSnapshot {
 	run: RunView;
 	nodes: StoredNode[];
+	idleLimitMs: number;
+}
+
+interface RunControl {
+	readonly nodeIds: readonly string[];
+	readonly controllers: Map<string, AbortController>;
+	readonly active: Set<string>;
+	mode: "running" | "cancelling" | "suspending" | "timing-out";
+	haltScheduling: boolean;
+	readonly affected: Set<string>;
+	apply?: (mode: RunControl["mode"], nodeIds: readonly string[]) => Promise<void>;
 }
 
 /**
@@ -257,250 +306,341 @@ interface StoredSnapshot {
  */
 export function createSubagentRuntime(options: SubagentRuntimeOptions): SubagentRuntime {
 	const runner = options.runner ?? new SubprocessJsonRunner();
-	const ownedDetachedRuns = new Map<string, Promise<LaunchResult>>();
+	const executions = new Map<string, Promise<LaunchResult>>();
+	const controls = new Map<string, RunControl>();
+	const clock = options.clock ?? systemClock;
+	const defaultIdleLimitMs = options.idleLimitMs ?? DEFAULT_IDLE_LIMIT_MS;
+	const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+	validatePositiveDuration("Runtime idleLimitMs", defaultIdleLimitMs);
+	validatePositiveDuration("Runtime terminationGraceMs", terminationGraceMs);
 
-	const launch = (async (
-		graph: GraphDefinition,
-		launchOptions?: LaunchOptions,
-	): Promise<LaunchReceipt | LaunchResult> => {
-		const normalizedGraph = immutableGraphDefinition(graph);
-		if (normalizedGraph.nodes.length === 0) throw new Error("Graph must contain at least one node");
-		const concurrency = effectiveConcurrencyLimit(options.maxConcurrency, normalizedGraph.maxConcurrency);
-		const parentCwd = options.cwd ?? process.cwd();
-		const definitionDirectories = configuredDefinitionDirectories(parentCwd, options.definitionDirectories);
-		const preparedNodes: Array<{
-			node: NormalizedNode;
-			agentDefinition: Awaited<ReturnType<typeof resolveAgentDefinition>>;
-			policy: ExecutionPolicy;
-		}> = [];
-		for (const node of normalizedGraph.nodes) {
-			const definition = node.definition;
-			validateNodeDefinition(definition);
-			const agentDefinition = await resolveAgentDefinition(definition.agent, definitionDirectories);
-			if (agentDefinition.id !== definition.agent) {
-				throw new Error(`Agent definition ID mismatch: requested ${definition.agent}, found ${agentDefinition.id}`);
+	const prepareNodes = async (graph: NormalizedGraph, parentCwd: string) => {
+		const directories = configuredDefinitionDirectories(parentCwd, options.definitionDirectories);
+		const prepared: Array<{ node: NormalizedNode; agentDefinition: Awaited<ReturnType<typeof resolveAgentDefinition>>; policy: ExecutionPolicy }> = [];
+		for (const node of graph.nodes) {
+			validateNodeDefinition(node.definition);
+			const agentDefinition = await resolveAgentDefinition(node.definition.agent, directories);
+			if (agentDefinition.id !== node.definition.agent) {
+				throw new Error(`Agent definition ID mismatch: requested ${node.definition.agent}, found ${agentDefinition.id}`);
 			}
-			const policy = resolveExecutionPolicy(definition, agentDefinition, parentCwd);
+			const policy = resolveExecutionPolicy(node.definition, agentDefinition, parentCwd);
 			if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
 				throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
 			}
-			preparedNodes.push({ node, agentDefinition, policy });
+			prepared.push({ node, agentDefinition, policy });
 		}
+		return prepared;
+	};
 
-		const runId = `run_${randomUUID()}`;
+	const executeRun = async (
+		runId: string,
+		graph: NormalizedGraph,
+		preparedNodes: Awaited<ReturnType<typeof prepareNodes>>,
+		snapshot: StoredSnapshot,
+	): Promise<LaunchResult> => {
 		const runDirectory = join(options.storeDirectory, "runs", runId);
 		const manifestPath = join(runDirectory, "artifacts.json");
-		const nodes: StoredNode[] = preparedNodes.map(({ node, policy }) => ({
-			id: node.id,
-			agent: node.definition.agent,
-			logicalRole: node.definition.logicalRole,
-			state: "queued",
-			policy,
-			artifacts: [],
-		}));
-		const resultPaths = nodes.map((node) => join(runDirectory, "artifacts", "nodes", `${node.id}.json`));
-		const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes };
+		const resultPaths = snapshot.nodes.map((node) => join(runDirectory, "artifacts", "nodes", `${node.id}.json`));
+		const indexById = new Map(snapshot.nodes.map((node, index) => [node.id, index]));
+		const handoffs: HandoffEvidence[] = [];
+		const nodeViews = new Map<number, NodeView>();
 		let snapshotWrite = Promise.resolve();
+		let eventWrite = Promise.resolve();
 		const persistSnapshot = (): Promise<void> => {
 			const write = snapshotWrite.then(() => writeSnapshot(runDirectory, snapshot));
 			snapshotWrite = write;
 			return write;
 		};
-
-		await writeJsonAtomically(join(runDirectory, "graph.json"), normalizedGraph);
-		await persistSnapshot();
-		snapshot.run.state = "running";
-		await persistSnapshot();
-
-		const handoffs: HandoffEvidence[] = [];
-		const indexById = new Map(nodes.map((node, index) => [node.id, index]));
-
-		const executeNode = (index: number): Promise<NodeView> => {
-			const prepared = preparedNodes[index]!;
-			const node = nodes[index]!;
-			const predecessorIndexes = prepared.node.dependencies
-				.map((id) => indexById.get(id)!)
-				.sort((left, right) => left - right);
-			node.state = "running";
-			void persistSnapshot();
-
-			return (async (): Promise<NodeView> => {
-				let task = prepared.node.definition.task;
-				if (predecessorIndexes.length > 0) {
-					const predecessorArtifacts: Artifact[] = [];
-					const sections: string[] = [];
-					for (const predecessorIndex of predecessorIndexes) {
-						const predecessor = nodes[predecessorIndex]!;
-						const artifact = predecessor.artifacts.find((candidate) => candidate.kind === "result");
-						if (!artifact || !predecessor.resultPath) throw new Error(`Missing durable result for predecessor ${predecessor.id}`);
-						const result = JSON.parse(await readFile(predecessor.resultPath, "utf8")) as NodeResult;
-						if (result.state !== "completed" || result.output === undefined) {
-							throw new Error(`Unusable result for predecessor ${predecessor.id}`);
-						}
-						predecessorArtifacts.push(artifact);
-						sections.push(`## Output from ${predecessor.id}\n${result.output}`);
-					}
-					const memo = sections.join("\n\n");
-					const handoffArtifact: Artifact = {
-						kind: "handoff",
-						path: join(runDirectory, "artifacts", "handoffs", `${node.id}.txt`),
-					};
-					await writeTextAtomically(handoffArtifact.path, memo);
-					node.artifacts = [...node.artifacts, handoffArtifact];
-					const delivery = Buffer.byteLength(memo, "utf8") > MAX_INLINE_HANDOFF_BYTES ? "artifact" : "inline";
-					handoffs.push({
-						nodeId: node.id,
-						predecessorIds: predecessorIndexes.map((predecessorIndex) => nodes[predecessorIndex]!.id),
-						predecessorArtifacts,
-						artifact: handoffArtifact,
-						delivery,
-					});
-					task = delivery === "inline"
-						? `${task}\n\n${memo}`
-						: `${task}\n\n## Required predecessor handoff\nThe complete predecessor handoff is stored at: ${handoffArtifact.path}\nRead this artifact before starting.`;
+		const record = (state: LifecycleState, nodeId?: string, reason?: LifecycleEvent["reason"]): Promise<void> => {
+			const event: LifecycleEvent = { runId, state, ...(nodeId ? { nodeId } : {}), ...(reason ? { reason } : {}), at: clock.now() };
+			const write = eventWrite.then(() => appendFile(join(runDirectory, "events.jsonl"), `${JSON.stringify(event)}\n`, "utf8"));
+			eventWrite = write;
+			return write;
+		};
+		const control: RunControl = {
+			nodeIds: snapshot.nodes.map((node) => node.id),
+			controllers: new Map(),
+			active: new Set(),
+			mode: "running",
+			haltScheduling: false,
+			affected: new Set(),
+		};
+		controls.set(runId, control);
+		const activeWork = new Set<string>();
+		let idleTimer: unknown;
+		const clearIdleTimer = () => {
+			if (idleTimer !== undefined) clock.clearTimeout(idleTimer);
+			idleTimer = undefined;
+		};
+		const armIdleTimer = () => {
+			clearIdleTimer();
+			if ((control.mode !== "running" && control.haltScheduling) || activeWork.size !== 0) return;
+			idleTimer = clock.setTimeout(() => {
+				if (!control.haltScheduling && activeWork.size === 0) {
+					void control.apply?.("timing-out", snapshot.nodes.filter((node) => !isTerminal(node.state)).map((node) => node.id));
 				}
-
-				const resultPath = resultPaths[index]!;
-				const startedAt = Date.now();
-				let outcome: ChildRunnerResult;
-				try {
-					outcome = await runner.run({
-						runId,
-						nodeId: node.id,
-						agent: prepared.policy.agent,
-						logicalRole: prepared.node.definition.logicalRole,
-						task,
-						cwd: prepared.policy.cwd,
-						provider: prepared.policy.provider,
-						model: prepared.policy.model,
-						reasoning: prepared.policy.reasoning,
-						tools: prepared.policy.tools,
-						systemPrompt: childSystemPrompt(prepared.agentDefinition, prepared.policy),
-						freshResources: true,
-						recursiveDelegation: false,
-						approvalPrompts: false,
-					});
-				} catch (error) {
-					outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
+			}, snapshot.idleLimitMs);
+		};
+		const setStoredResult = async (
+			index: number,
+			state: Extract<LifecycleState, "failed" | "cancelled" | "suspended">,
+			error: FailureEvidence,
+		): Promise<void> => {
+			const node = snapshot.nodes[index]!;
+			if (isTerminal(node.state)) return;
+			const resultPath = state === "suspended"
+				? join(runDirectory, "artifacts", "checkpoints", `${node.id}-${randomUUID()}.json`)
+				: resultPaths[index]!;
+			const result: NodeResult = { state, error, policy: node.policy };
+			await writeJsonAtomically(resultPath, result);
+			node.resultPath = resultPath;
+			node.artifacts = [...node.artifacts, { kind: state === "suspended" ? "checkpoint" : "failure", path: resultPath }];
+			node.state = state;
+			nodeViews.set(index, toNodeView(node, result));
+			await record(state, node.id, state === "failed" && error.kind === "timeout" ? "timeout" : state);
+		};
+		control.apply = async (mode, nodeIds) => {
+			if (control.mode !== "running" && mode !== "suspending" && !(mode === "timing-out" && !control.haltScheduling)) return;
+			control.mode = mode;
+			control.haltScheduling = mode !== "cancelling" || nodeIds.length === control.nodeIds.length;
+			clearIdleTimer();
+			for (const nodeId of nodeIds) {
+				control.affected.add(nodeId);
+				const index = indexById.get(nodeId);
+				if (index === undefined) continue;
+				const node = snapshot.nodes[index]!;
+				if (node.state === "queued") {
+					const error: FailureEvidence = mode === "timing-out"
+						? { kind: "timeout", message: `Idle limit of ${snapshot.idleLimitMs}ms exceeded` }
+						: { kind: "cancelled", message: mode === "suspending" ? "Run suspended" : "Run cancelled" };
+					await setStoredResult(index, mode === "timing-out" ? "failed" : mode === "suspending" ? "suspended" : "cancelled", error);
 				}
-				outcome = withDuration(outcome, Date.now() - startedAt);
-
-				const artifact: Artifact = {
-					kind: outcome.state === "completed" ? "result" : "failure",
-					path: resultPath,
-				};
-				const result: NodeResult = outcome.state === "completed"
-					? { state: "completed", output: outcome.output, usage: outcome.usage, policy: prepared.policy }
-					: {
-						state: outcome.state,
-						...(outcome.error === undefined ? {} : { error: outcome.error }),
-						usage: outcome.usage,
-						policy: prepared.policy,
-					};
-
-				// Persist the complete terminal result before exposing the terminal node state.
-				await writeJsonAtomically(resultPath, result);
-				node.artifacts = [...node.artifacts, artifact];
-				node.usage = outcome.usage;
-				node.resultPath = resultPath;
-				node.state = outcome.state;
-				await persistSnapshot();
-
-				return toNodeView(node, result);
-			})();
+				control.controllers.get(nodeId)?.abort();
+			}
+			await persistSnapshot();
 		};
 
-		const execution = (async (): Promise<LaunchResult> => {
-			const results: Array<NodeView | undefined> = new Array(nodes.length);
-			let active: Array<{ index: number; execution: Promise<NodeView> }> = [];
-			while (true) {
-				let blocked = false;
-				for (let index = 0; index < nodes.length; index += 1) {
-					const node = nodes[index]!;
-					if (node.state !== "queued") continue;
-					const blockers = preparedNodes[index]!.node.dependencies.filter((id) => {
-						const predecessor = nodes[indexById.get(id)!]!;
-						return predecessor.state === "failed" || predecessor.state === "cancelled" || predecessor.blockedBy !== undefined;
-					});
-					if (blockers.length > 0) {
-						node.blockedBy = blockers;
-						blocked = true;
-					}
+		const executeNode = async (index: number): Promise<NodeView> => {
+			const prepared = preparedNodes[index]!;
+			const node = snapshot.nodes[index]!;
+			const predecessorIndexes = prepared.node.dependencies.map((id) => indexById.get(id)!).sort((left, right) => left - right);
+			node.state = "running";
+			void record("running", node.id);
+			void persistSnapshot();
+			let task = prepared.node.definition.task;
+			if (predecessorIndexes.length > 0) {
+				const predecessorArtifacts: Artifact[] = [];
+				const sections: string[] = [];
+				for (const predecessorIndex of predecessorIndexes) {
+					const predecessor = snapshot.nodes[predecessorIndex]!;
+					const artifact = predecessor.artifacts.find((candidate) => candidate.kind === "result");
+					if (!artifact || !predecessor.resultPath) throw new Error(`Missing durable result for predecessor ${predecessor.id}`);
+					const result = JSON.parse(await readFile(predecessor.resultPath, "utf8")) as NodeResult;
+					if (result.state !== "completed" || result.output === undefined) throw new Error(`Unusable result for predecessor ${predecessor.id}`);
+					predecessorArtifacts.push(artifact);
+					sections.push(`## Output from ${predecessor.id}\n${result.output}`);
 				}
-				if (blocked) await persistSnapshot();
-
-				while (active.length < concurrency) {
-					const index = nodes.findIndex((node, candidate) => node.state === "queued"
-						&& node.blockedBy === undefined
-						&& preparedNodes[candidate]!.node.dependencies.every((id) => nodes[indexById.get(id)!]!.state === "completed"));
-					if (index < 0) break;
-					active.push({ index, execution: executeNode(index) });
-				}
-
-				if (active.length === 0) break;
-				const settled = await Promise.race(active.map(async ({ index, execution }) => ({ index, view: await execution })));
-				results[settled.index] = settled.view;
-				active = active.filter((candidate) => candidate.index !== settled.index);
+				const memo = sections.join("\n\n");
+				const handoffArtifact: Artifact = { kind: "handoff", path: join(runDirectory, "artifacts", "handoffs", `${node.id}.txt`) };
+				await writeTextAtomically(handoffArtifact.path, memo);
+				node.artifacts = [...node.artifacts, handoffArtifact];
+				const delivery = Buffer.byteLength(memo, "utf8") > MAX_INLINE_HANDOFF_BYTES ? "artifact" : "inline";
+				handoffs.push({ nodeId: node.id, predecessorIds: predecessorIndexes.map((predecessorIndex) => snapshot.nodes[predecessorIndex]!.id), predecessorArtifacts, artifact: handoffArtifact, delivery });
+				task = delivery === "inline" ? `${task}\n\n${memo}` : `${task}\n\n## Required predecessor handoff\nThe complete predecessor handoff is stored at: ${handoffArtifact.path}\nRead this artifact before starting.`;
 			}
-
-			const finalNodes = nodes.map((node, index) => results[index] ?? toNodeView(node));
-			snapshot.run.state = finalNodes.some((node) => node.state === "cancelled")
-				? "cancelled"
-				: finalNodes.every((node) => node.state === "completed") ? "completed" : "failed";
-			const graphArtifact: Artifact = { kind: "graph-result", path: join(runDirectory, "artifacts", "graph-result.json") };
-			const artifacts = [...nodes.flatMap((node) => node.artifacts), graphArtifact];
-			const finalNode = finalNodes.at(-1)!;
-			const aggregate: LaunchResult = {
-				run: { ...snapshot.run },
-				nodes: finalNodes,
-				...(finalNode.result?.state === "completed" ? { finalOutput: finalNode.result.output } : {}),
-				trace: finalNodes.map((node, index) => ({
-					nodeId: node.id,
-					logicalRole: node.logicalRole,
-					state: node.state,
-					predecessorIds: [...preparedNodes[index]!.node.dependencies],
-					...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}),
-				})),
-				artifacts,
-				handoffs: [...handoffs].sort((left, right) => indexById.get(left.nodeId)! - indexById.get(right.nodeId)!),
-			};
-			await writeJsonAtomically(graphArtifact.path, aggregate);
-			await writeJsonAtomically(manifestPath, artifacts);
+			const controller = new AbortController();
+			control.controllers.set(node.id, controller);
+			control.active.add(node.id);
+			activeWork.add(node.id);
+			clearIdleTimer();
+			const startedAt = clock.now();
+			let outcome: ChildRunnerResult;
+			try {
+				outcome = await runner.run({
+					runId, nodeId: node.id, agent: prepared.policy.agent, logicalRole: prepared.node.definition.logicalRole, task,
+					cwd: prepared.policy.cwd, provider: prepared.policy.provider, model: prepared.policy.model, reasoning: prepared.policy.reasoning,
+					tools: prepared.policy.tools, systemPrompt: childSystemPrompt(prepared.agentDefinition, prepared.policy),
+					freshResources: true, recursiveDelegation: false, approvalPrompts: false,
+				}, {
+					signal: controller.signal,
+					terminationGraceMs,
+					onActivityChange: (active) => {
+						if (active) activeWork.add(node.id);
+						else activeWork.delete(node.id);
+						armIdleTimer();
+					},
+				});
+			} catch (error) {
+				outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
+			}
+			control.controllers.delete(node.id);
+			control.active.delete(node.id);
+			activeWork.delete(node.id);
+			armIdleTimer();
+			outcome = withDuration(outcome, clock.now() - startedAt);
+			let state: NodeResult["state"] = outcome.state;
+			let error = outcome.state === "completed" ? undefined : outcome.error;
+			if (control.affected.has(node.id)) {
+				if (control.mode === "suspending") {
+					state = "suspended";
+					error = { kind: "cancelled", message: "Run suspended", ...(outcome.state === "completed" ? { partialOutput: outcome.output } : {}) };
+				} else if (control.mode === "timing-out") {
+					state = "failed";
+					error = { kind: "timeout", message: `Idle limit of ${snapshot.idleLimitMs}ms exceeded`, ...(outcome.state === "completed" ? { partialOutput: outcome.output } : {}) };
+				} else {
+					state = "cancelled";
+					error = { kind: "cancelled", message: "Run cancelled", ...(outcome.state === "completed" ? { partialOutput: outcome.output } : {}) };
+				}
+			}
+			const resultPath = state === "suspended"
+				? join(runDirectory, "artifacts", "checkpoints", `${node.id}-${randomUUID()}.json`)
+				: resultPaths[index]!;
+			const result: NodeResult = state === "completed"
+				? { state, output: (outcome as Extract<ChildRunnerResult, { state: "completed" }>).output, usage: outcome.usage, policy: prepared.policy }
+				: { state, ...(error ? { error } : {}), usage: outcome.usage, policy: prepared.policy };
+			await writeJsonAtomically(resultPath, result);
+			node.resultPath = resultPath;
+			node.artifacts = [...node.artifacts, { kind: state === "completed" ? "result" : state === "suspended" ? "checkpoint" : "failure", path: resultPath }];
+			node.usage = outcome.usage;
+			node.state = state;
+			const view = toNodeView(node, result);
+			nodeViews.set(index, view);
+			await record(state, node.id, state === "failed" && error?.kind === "timeout" ? "timeout" : state === "suspended" ? "suspended" : state === "cancelled" ? "cancelled" : undefined);
 			await persistSnapshot();
-			return aggregate;
-		})();
+			return view;
+		};
 
+		for (const node of snapshot.nodes) {
+			if (node.state === "queued") void record("queued", node.id);
+		}
+		void record("running");
+		const results: Array<NodeView | undefined> = new Array(snapshot.nodes.length);
+		let active: Array<{ index: number; execution: Promise<NodeView> }> = [];
+		while (true) {
+			let blocked = false;
+			for (let index = 0; index < snapshot.nodes.length; index += 1) {
+				const node = snapshot.nodes[index]!;
+				if (node.state !== "queued") continue;
+				const blockers = preparedNodes[index]!.node.dependencies.filter((id) => {
+					const predecessor = snapshot.nodes[indexById.get(id)!]!;
+					return predecessor.state === "failed" || predecessor.state === "cancelled" || predecessor.blockedBy !== undefined;
+				});
+				if (blockers.length > 0) { node.blockedBy = blockers; blocked = true; }
+			}
+			if (blocked) await persistSnapshot();
+			while ((!control.haltScheduling) && active.length < effectiveConcurrencyLimit(options.maxConcurrency, graph.maxConcurrency)) {
+				const index = snapshot.nodes.findIndex((node, candidate) => node.state === "queued" && node.blockedBy === undefined && preparedNodes[candidate]!.node.dependencies.every((id) => snapshot.nodes[indexById.get(id)!]!.state === "completed"));
+				if (index < 0) break;
+				active.push({ index, execution: executeNode(index) });
+			}
+			if (active.length === 0) break;
+			const settled = await Promise.race(active.map(async ({ index, execution }) => ({ index, view: await execution })));
+			results[settled.index] = settled.view;
+			active = active.filter((candidate) => candidate.index !== settled.index);
+		}
+		clearIdleTimer();
+		const finalNodes = snapshot.nodes.map((node, index) => results[index] ?? nodeViews.get(index) ?? toNodeView(node));
+		snapshot.run.state = finalNodes.every((node) => node.state === "completed")
+			? "completed"
+			: finalNodes.some((node) => node.state === "suspended") ? "suspended"
+			: finalNodes.some((node) => node.state === "cancelled") ? "cancelled" : "failed";
+		const graphArtifact: Artifact = { kind: "graph-result", path: join(runDirectory, "artifacts", "graph-result.json") };
+		const artifacts = [...snapshot.nodes.flatMap((node) => node.artifacts), graphArtifact];
+		const finalNode = finalNodes.at(-1)!;
+		const aggregate: LaunchResult = {
+			run: { ...snapshot.run }, nodes: finalNodes,
+			...(finalNode.result?.state === "completed" ? { finalOutput: finalNode.result.output } : {}),
+			trace: finalNodes.map((node, index) => ({ nodeId: node.id, logicalRole: node.logicalRole, state: node.state, predecessorIds: [...preparedNodes[index]!.node.dependencies], ...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}) })),
+			artifacts, handoffs: [...handoffs].sort((left, right) => indexById.get(left.nodeId)! - indexById.get(right.nodeId)!),
+		};
+		await writeJsonAtomically(graphArtifact.path, aggregate);
+		await writeJsonAtomically(manifestPath, artifacts);
+		await record(snapshot.run.state);
+		await persistSnapshot();
+		await eventWrite;
+		controls.delete(runId);
+		return aggregate;
+	};
+
+	const startRun = (runId: string, graph: NormalizedGraph, prepared: Awaited<ReturnType<typeof prepareNodes>>, snapshot: StoredSnapshot) => {
+		const execution = executeRun(runId, graph, prepared, snapshot);
+		executions.set(runId, execution);
+		void execution.finally(() => {
+			executions.delete(runId);
+			controls.delete(runId);
+		}).catch(() => undefined);
+		return execution;
+	};
+
+	const launch = (async (graphDefinition: GraphDefinition, launchOptions?: LaunchOptions): Promise<LaunchReceipt | LaunchResult> => {
+		const graph = immutableGraphDefinition(graphDefinition);
+		if (graph.nodes.length === 0) throw new Error("Graph must contain at least one node");
+		const idleLimitMs = launchOptions?.idleLimitMs ?? defaultIdleLimitMs;
+		validatePositiveDuration("Run idleLimitMs", idleLimitMs);
+		effectiveConcurrencyLimit(options.maxConcurrency, graph.maxConcurrency);
+		const parentCwd = options.cwd ?? process.cwd();
+		const prepared = await prepareNodes(graph, parentCwd);
+		const runId = `run_${randomUUID()}`;
+		const runDirectory = join(options.storeDirectory, "runs", runId);
+		const snapshot: StoredSnapshot = {
+			run: { id: runId, state: "running" }, idleLimitMs,
+			nodes: prepared.map(({ node, policy }) => ({ id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] })),
+		};
+		await writeJsonAtomically(join(runDirectory, "graph.json"), graph);
+		await writeSnapshot(runDirectory, snapshot);
+		const execution = startRun(runId, graph, prepared, snapshot);
 		if (launchOptions?.delivery === "blocking") return execution;
-
-		ownedDetachedRuns.set(runId, execution);
-		// A detached receipt must observe the queued nodes as running before it returns.
-		await snapshotWrite;
-		// Detached callers may never join; retain rejection handling for storage failures.
-		void execution.catch(() => undefined);
+		// The receipt guarantees that every initially ready node is durably visible as running.
+		await writeSnapshot(runDirectory, snapshot);
 		return { run: { ...snapshot.run } };
 	}) as SubagentRuntime["launch"];
 
 	return {
 		launch,
-
-		status: async (runId: string): Promise<StatusView> => {
+		status: async (runId) => {
 			const snapshot = await readSnapshot(options.storeDirectory, runId);
 			const usage = usageTotals(snapshot.nodes);
-			return {
-				run: { ...snapshot.run },
-				nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })),
-				...(usage ? { usage } : {}),
-			};
+			return { run: { ...snapshot.run }, nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })), ...(usage ? { usage } : {}) };
 		},
-
-		join: async (runId: string): Promise<LaunchResult> => {
+		join: async (runId) => {
 			await readSnapshot(options.storeDirectory, runId);
-			const execution = ownedDetachedRuns.get(runId);
+			const execution = executions.get(runId);
 			if (!execution) throw new Error(`Run is not owned by this runtime: ${runId}`);
 			return execution;
 		},
-
-		result: async (runId: string, nodeId: string): Promise<NodeResult> => {
+		cancel: (runId, nodeId) => {
+			const control = controls.get(runId);
+			const execution = executions.get(runId);
+			if (!control || !execution) return Promise.reject(new Error(`Run is not owned by this runtime: ${runId}`));
+			if (nodeId === undefined) return control.apply!("cancelling", control.nodeIds).then(() => execution);
+			return readGraph(options.storeDirectory, runId).then((graph) => {
+				const nodeIds = descendantNodeIds(graph, nodeId);
+				if (nodeIds.length === 0) throw new Error(`Unknown node: ${nodeId}`);
+				return control.apply!("cancelling", nodeIds).then(() => execution);
+			});
+		},
+		resume: async (runId) => {
+			const snapshot = await readSnapshot(options.storeDirectory, runId);
+			if (snapshot.run.state !== "suspended") throw new Error(`Run is not suspended: ${runId}`);
+			const graph = await readGraph(options.storeDirectory, runId);
+			const prepared = await prepareNodes(graph, options.cwd ?? process.cwd());
+			for (const node of snapshot.nodes) {
+				if (node.state !== "completed") {
+					node.state = "queued";
+					node.blockedBy = undefined;
+					node.resultPath = undefined;
+				}
+			}
+			snapshot.run.state = "running";
+			await writeSnapshot(join(options.storeDirectory, "runs", runId), snapshot);
+			return startRun(runId, graph, prepared, snapshot);
+		},
+		dispose: async () => {
+			await Promise.all([...controls.values()].map((control) => control.apply!("suspending", control.nodeIds)));
+			await Promise.all([...executions.values()].map(async (execution) => { await execution; }));
+		},
+		events: async (runId) => readEvents(options.storeDirectory, runId),
+		result: async (runId, nodeId) => {
 			const snapshot = await readSnapshot(options.storeDirectory, runId);
 			const node = snapshot.nodes.find((candidate) => candidate.id === nodeId);
 			if (!node) throw new Error(`Unknown node: ${nodeId}`);
@@ -509,6 +649,19 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		},
 	};
 }
+const systemClock: RuntimeClock = {
+	now: () => Date.now(),
+	setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+	clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
+
+function validatePositiveDuration(label: string, value: number): void {
+	if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive safe integer`);
+}
+
+function isTerminal(state: LifecycleState): boolean {
+	return state === "completed" || state === "failed" || state === "cancelled";
+}
 
 function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly<NodeDefinition> {
 	const tools = definition.tools ? Object.freeze([...definition.tools]) : undefined;
@@ -516,6 +669,8 @@ function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly
 }
 
 export const DEFAULT_MAX_CONCURRENCY = 6;
+export const DEFAULT_IDLE_LIMIT_MS = 10 * 60 * 1000;
+export const DEFAULT_TERMINATION_GRACE_MS = 5_000;
 /** Large handoffs remain complete on disk and enter child context by explicit path. */
 export const MAX_INLINE_HANDOFF_BYTES = 50 * 1024;
 
@@ -698,6 +853,44 @@ function toNodeView(node: StoredNode, result?: NodeResult): NodeView {
 	};
 }
 
+async function readGraph(storeDirectory: string, runId: string): Promise<NormalizedGraph> {
+	try {
+		return JSON.parse(await readFile(join(storeDirectory, "runs", runId, "graph.json"), "utf8")) as NormalizedGraph;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Unknown run: ${runId}`);
+		throw error;
+	}
+}
+
+function descendantNodeIds(graph: NormalizedGraph, nodeId: string): string[] {
+	if (!graph.nodes.some((node) => node.id === nodeId)) return [];
+	const selected = new Set([nodeId]);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const node of graph.nodes) {
+			if (node.dependencies.some((dependency) => selected.has(dependency)) && !selected.has(node.id)) {
+				selected.add(node.id);
+				changed = true;
+			}
+		}
+	}
+	return graph.nodes.filter((node) => selected.has(node.id)).map((node) => node.id);
+}
+
+async function readEvents(storeDirectory: string, runId: string): Promise<LifecycleEvent[]> {
+	try {
+		const source = await readFile(join(storeDirectory, "runs", runId, "events.jsonl"), "utf8");
+		return source.split("\n").filter(Boolean).map((line) => JSON.parse(line) as LifecycleEvent);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			await readSnapshot(storeDirectory, runId);
+			return [];
+		}
+		throw error;
+	}
+}
+
 async function readSnapshot(storeDirectory: string, runId: string): Promise<StoredSnapshot> {
 	try {
 		return JSON.parse(await readFile(join(storeDirectory, "runs", runId, "snapshot.json"), "utf8")) as StoredSnapshot;
@@ -772,7 +965,7 @@ function freshChildEnvironment(): NodeJS.ProcessEnv {
 export class SubprocessJsonRunner implements ChildRunner {
 	constructor(private readonly executable = "pi") {}
 
-	async run(request: ChildRunnerRequest): Promise<ChildRunnerResult> {
+	async run(request: ChildRunnerRequest, options: ChildRunnerOptions = {}): Promise<ChildRunnerResult> {
 		const startedAt = Date.now();
 		const args = ["--mode", "json", "-p", "--no-session"];
 		args.push("--provider", request.provider);
@@ -783,12 +976,18 @@ export class SubprocessJsonRunner implements ChildRunner {
 		args.push(request.task);
 
 		return new Promise<ChildRunnerResult>((resolve, reject) => {
-			const child = spawn(this.executable, args, {
+			let child: ReturnType<typeof spawn>;
+			try {
+				child = spawn(this.executable, args, {
 				cwd: request.cwd,
 				env: freshChildEnvironment(),
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (error) {
+				reject(error);
+				return;
+			}
 			let stdout = "";
 			let stderr = "";
 			let settled = false;
@@ -799,6 +998,17 @@ export class SubprocessJsonRunner implements ChildRunner {
 			let model: string | undefined;
 			let inputTokens: number | undefined;
 			let outputTokens: number | undefined;
+			let abortRequested = options.signal?.aborted ?? false;
+			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			const abort = () => {
+				abortRequested = true;
+				child.kill("SIGTERM");
+				killTimer = setTimeout(() => child.kill("SIGKILL"), options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS);
+			};
+			if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
+			if (abortRequested) abort();
+			// Until Pi reports agent or tool activity, a stalled child is idle.
+			options.onActivityChange?.(false);
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -810,6 +1020,8 @@ export class SubprocessJsonRunner implements ChildRunner {
 					return;
 				}
 				if (!isRecord(event)) return;
+				if (event.type === "agent_start" || event.type === "tool_execution_start") options.onActivityChange?.(true);
+				if (event.type === "agent_end" || event.type === "tool_execution_end" || event.type === "agent_settled") options.onActivityChange?.(false);
 				if (event.type === "agent_settled") settled = true;
 				if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return;
 
@@ -832,6 +1044,9 @@ export class SubprocessJsonRunner implements ChildRunner {
 			child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
 			child.once("error", reject);
 			child.once("close", (code) => {
+				if (killTimer !== undefined) clearTimeout(killTimer);
+				if (options.signal) options.signal.removeEventListener("abort", abort);
+				options.onActivityChange?.(false);
 				processLine(stdout);
 				const usage: UsageRecord = {
 					provider,
@@ -840,7 +1055,7 @@ export class SubprocessJsonRunner implements ChildRunner {
 					outputTokens,
 					durationMs: Math.max(0, Date.now() - startedAt),
 				};
-				if (stopReason === "aborted") {
+				if (abortRequested || stopReason === "aborted") {
 					resolve({
 						state: "cancelled",
 						error: { kind: "cancelled", message: "Pi stopped before settlement", stderr, partialOutput: finalOutput },
