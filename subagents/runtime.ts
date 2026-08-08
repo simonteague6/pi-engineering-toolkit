@@ -21,7 +21,7 @@ export interface UsageRecord {
 }
 
 export interface Artifact {
-	kind: "result" | "failure";
+	kind: "result" | "failure" | "handoff" | "graph-result";
 	path: string;
 }
 
@@ -58,11 +58,37 @@ export interface ParallelGraph {
 	readonly maxConcurrency?: number;
 }
 
+/** Public ergonomic form for ordered dependent child nodes. */
+export interface ChainGraph {
+	readonly kind: "chain";
+	readonly nodes: readonly Readonly<NodeDefinition>[];
+	readonly maxConcurrency?: number;
+}
+
+/** A statically named DAG node with its direct required predecessors. */
+export interface DagNodeDefinition extends NodeDefinition {
+	readonly id: string;
+	readonly dependsOn?: readonly string[];
+}
+
+/** Public form for a static acyclic dependency graph. */
+export interface DagGraph {
+	readonly kind: "dag";
+	readonly nodes: readonly Readonly<DagNodeDefinition>[];
+	readonly maxConcurrency?: number;
+}
+
 /** Public graph forms normalized to one private immutable graph before execution. */
-export type GraphDefinition = SingleGraph | ParallelGraph;
+export type GraphDefinition = SingleGraph | ParallelGraph | ChainGraph | DagGraph;
+
+interface NormalizedNode {
+	readonly id: string;
+	readonly definition: Readonly<NodeDefinition>;
+	readonly dependencies: readonly string[];
+}
 
 interface NormalizedGraph {
-	readonly nodes: readonly Readonly<NodeDefinition>[];
+	readonly nodes: readonly NormalizedNode[];
 	readonly maxConcurrency?: number;
 }
 
@@ -121,8 +147,27 @@ export interface NodeView {
 	state: LifecycleState;
 	policy: ExecutionPolicy;
 	artifacts: Artifact[];
+	blockedBy?: string[];
 	usage?: UsageRecord;
 	result?: NodeResult;
+}
+
+/** Durable evidence that a node received every direct predecessor result. */
+export interface HandoffEvidence {
+	nodeId: string;
+	predecessorIds: string[];
+	predecessorArtifacts: Artifact[];
+	artifact: Artifact;
+	delivery: "inline" | "artifact";
+}
+
+/** Compact terminal node history in graph declaration order. */
+export interface NodeTrace {
+	nodeId: string;
+	logicalRole: string;
+	state: LifecycleState;
+	predecessorIds: string[];
+	blockedBy?: string[];
 }
 
 export interface RunView {
@@ -130,10 +175,14 @@ export interface RunView {
 	state: LifecycleState;
 }
 
-/** Terminal aggregate in declaration order. */
+/** Terminal aggregate in declaration order with durable graph evidence. */
 export interface LaunchResult {
 	run: RunView;
 	nodes: NodeView[];
+	finalOutput?: string;
+	trace: NodeTrace[];
+	artifacts: Artifact[];
+	handoffs: HandoffEvidence[];
 }
 
 export interface LaunchReceipt {
@@ -190,6 +239,7 @@ interface StoredNode {
 	state: LifecycleState;
 	policy: ExecutionPolicy;
 	artifacts: Artifact[];
+	blockedBy?: string[];
 	usage?: UsageRecord;
 	resultPath?: string;
 }
@@ -219,11 +269,12 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const parentCwd = options.cwd ?? process.cwd();
 		const definitionDirectories = configuredDefinitionDirectories(parentCwd, options.definitionDirectories);
 		const preparedNodes: Array<{
-			definition: Readonly<NodeDefinition>;
+			node: NormalizedNode;
 			agentDefinition: Awaited<ReturnType<typeof resolveAgentDefinition>>;
 			policy: ExecutionPolicy;
 		}> = [];
-		for (const definition of normalizedGraph.nodes) {
+		for (const node of normalizedGraph.nodes) {
+			const definition = node.definition;
 			validateNodeDefinition(definition);
 			const agentDefinition = await resolveAgentDefinition(definition.agent, definitionDirectories);
 			if (agentDefinition.id !== definition.agent) {
@@ -233,21 +284,21 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			if (!(await options.modelCatalog.isAvailable(policy.provider, policy.model))) {
 				throw new Error(`Unavailable model: ${policy.provider}/${policy.model}`);
 			}
-			preparedNodes.push({ definition, agentDefinition, policy });
+			preparedNodes.push({ node, agentDefinition, policy });
 		}
 
 		const runId = `run_${randomUUID()}`;
 		const runDirectory = join(options.storeDirectory, "runs", runId);
 		const manifestPath = join(runDirectory, "artifacts.json");
-		const nodes: StoredNode[] = preparedNodes.map(({ definition, policy }) => ({
-			id: `node_${randomUUID()}`,
-			agent: definition.agent,
-			logicalRole: definition.logicalRole,
+		const nodes: StoredNode[] = preparedNodes.map(({ node, policy }) => ({
+			id: node.id,
+			agent: node.definition.agent,
+			logicalRole: node.definition.logicalRole,
 			state: "queued",
 			policy,
 			artifacts: [],
 		}));
-		const resultPaths = nodes.map((node) => join(runDirectory, "artifacts", `${node.id}.json`));
+		const resultPaths = nodes.map((node) => join(runDirectory, "artifacts", "nodes", `${node.id}.json`));
 		const snapshot: StoredSnapshot = { run: { id: runId, state: "queued" }, nodes };
 		let snapshotWrite = Promise.resolve();
 		const persistSnapshot = (): Promise<void> => {
@@ -259,89 +310,171 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		await writeJsonAtomically(join(runDirectory, "graph.json"), normalizedGraph);
 		await persistSnapshot();
 		snapshot.run.state = "running";
-		for (const node of nodes.slice(0, Math.min(concurrency, nodes.length))) node.state = "running";
 		await persistSnapshot();
 
-		const executeNode = async (index: number): Promise<NodeView> => {
+		const handoffs: HandoffEvidence[] = [];
+		const indexById = new Map(nodes.map((node, index) => [node.id, index]));
+
+		const executeNode = (index: number): Promise<NodeView> => {
 			const prepared = preparedNodes[index]!;
 			const node = nodes[index]!;
-			const resultPath = resultPaths[index]!;
-			if (node.state === "queued") {
-				node.state = "running";
-				await persistSnapshot();
-			}
+			const predecessorIndexes = prepared.node.dependencies
+				.map((id) => indexById.get(id)!)
+				.sort((left, right) => left - right);
+			node.state = "running";
+			void persistSnapshot();
 
-			const startedAt = Date.now();
-			let outcome: ChildRunnerResult;
-			try {
-				outcome = await runner.run({
-					runId,
-					nodeId: node.id,
-					agent: prepared.policy.agent,
-					logicalRole: prepared.definition.logicalRole,
-					task: prepared.definition.task,
-					cwd: prepared.policy.cwd,
-					provider: prepared.policy.provider,
-					model: prepared.policy.model,
-					reasoning: prepared.policy.reasoning,
-					tools: prepared.policy.tools,
-					systemPrompt: childSystemPrompt(prepared.agentDefinition, prepared.policy),
-					freshResources: true,
-					recursiveDelegation: false,
-					approvalPrompts: false,
-				});
-			} catch (error) {
-				outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
-			}
-			outcome = withDuration(outcome, Date.now() - startedAt);
+			return (async (): Promise<NodeView> => {
+				let task = prepared.node.definition.task;
+				if (predecessorIndexes.length > 0) {
+					const predecessorArtifacts: Artifact[] = [];
+					const sections: string[] = [];
+					for (const predecessorIndex of predecessorIndexes) {
+						const predecessor = nodes[predecessorIndex]!;
+						const artifact = predecessor.artifacts.find((candidate) => candidate.kind === "result");
+						if (!artifact || !predecessor.resultPath) throw new Error(`Missing durable result for predecessor ${predecessor.id}`);
+						const result = JSON.parse(await readFile(predecessor.resultPath, "utf8")) as NodeResult;
+						if (result.state !== "completed" || result.output === undefined) {
+							throw new Error(`Unusable result for predecessor ${predecessor.id}`);
+						}
+						predecessorArtifacts.push(artifact);
+						sections.push(`## Output from ${predecessor.id}\n${result.output}`);
+					}
+					const memo = sections.join("\n\n");
+					const handoffArtifact: Artifact = {
+						kind: "handoff",
+						path: join(runDirectory, "artifacts", "handoffs", `${node.id}.txt`),
+					};
+					await writeTextAtomically(handoffArtifact.path, memo);
+					node.artifacts = [...node.artifacts, handoffArtifact];
+					const delivery = Buffer.byteLength(memo, "utf8") > MAX_INLINE_HANDOFF_BYTES ? "artifact" : "inline";
+					handoffs.push({
+						nodeId: node.id,
+						predecessorIds: predecessorIndexes.map((predecessorIndex) => nodes[predecessorIndex]!.id),
+						predecessorArtifacts,
+						artifact: handoffArtifact,
+						delivery,
+					});
+					task = delivery === "inline"
+						? `${task}\n\n${memo}`
+						: `${task}\n\n## Required predecessor handoff\nThe complete predecessor handoff is stored at: ${handoffArtifact.path}\nRead this artifact before starting.`;
+				}
 
-			const artifact: Artifact = {
-				kind: outcome.state === "completed" ? "result" : "failure",
-				path: resultPath,
-			};
-			const result: NodeResult = outcome.state === "completed"
-				? { state: "completed", output: outcome.output, usage: outcome.usage, policy: prepared.policy }
-				: {
-					state: outcome.state,
-					...(outcome.error === undefined ? {} : { error: outcome.error }),
-					usage: outcome.usage,
-					policy: prepared.policy,
+				const resultPath = resultPaths[index]!;
+				const startedAt = Date.now();
+				let outcome: ChildRunnerResult;
+				try {
+					outcome = await runner.run({
+						runId,
+						nodeId: node.id,
+						agent: prepared.policy.agent,
+						logicalRole: prepared.node.definition.logicalRole,
+						task,
+						cwd: prepared.policy.cwd,
+						provider: prepared.policy.provider,
+						model: prepared.policy.model,
+						reasoning: prepared.policy.reasoning,
+						tools: prepared.policy.tools,
+						systemPrompt: childSystemPrompt(prepared.agentDefinition, prepared.policy),
+						freshResources: true,
+						recursiveDelegation: false,
+						approvalPrompts: false,
+					});
+				} catch (error) {
+					outcome = { state: "failed", error: { kind: "startup", message: errorMessage(error) } };
+				}
+				outcome = withDuration(outcome, Date.now() - startedAt);
+
+				const artifact: Artifact = {
+					kind: outcome.state === "completed" ? "result" : "failure",
+					path: resultPath,
 				};
+				const result: NodeResult = outcome.state === "completed"
+					? { state: "completed", output: outcome.output, usage: outcome.usage, policy: prepared.policy }
+					: {
+						state: outcome.state,
+						...(outcome.error === undefined ? {} : { error: outcome.error }),
+						usage: outcome.usage,
+						policy: prepared.policy,
+					};
 
-			// Persist the complete terminal result before exposing the terminal node state.
-			await writeJsonAtomically(resultPath, result);
-			node.artifacts = [artifact];
-			node.usage = outcome.usage;
-			node.resultPath = resultPath;
-			node.state = outcome.state;
-			await persistSnapshot();
+				// Persist the complete terminal result before exposing the terminal node state.
+				await writeJsonAtomically(resultPath, result);
+				node.artifacts = [...node.artifacts, artifact];
+				node.usage = outcome.usage;
+				node.resultPath = resultPath;
+				node.state = outcome.state;
+				await persistSnapshot();
 
-			return toNodeView(node, result);
+				return toNodeView(node, result);
+			})();
 		};
 
 		const execution = (async (): Promise<LaunchResult> => {
-			let nextIndex = 0;
-			const results: NodeView[] = new Array(nodes.length);
-			const worker = async (): Promise<void> => {
-				while (nextIndex < nodes.length) {
-					const index = nextIndex;
-					nextIndex += 1;
-					results[index] = await executeNode(index);
+			const results: Array<NodeView | undefined> = new Array(nodes.length);
+			let active: Array<{ index: number; execution: Promise<NodeView> }> = [];
+			while (true) {
+				let blocked = false;
+				for (let index = 0; index < nodes.length; index += 1) {
+					const node = nodes[index]!;
+					if (node.state !== "queued") continue;
+					const blockers = preparedNodes[index]!.node.dependencies.filter((id) => {
+						const predecessor = nodes[indexById.get(id)!]!;
+						return predecessor.state === "failed" || predecessor.state === "cancelled" || predecessor.blockedBy !== undefined;
+					});
+					if (blockers.length > 0) {
+						node.blockedBy = blockers;
+						blocked = true;
+					}
 				}
-			};
-			await Promise.all(Array.from({ length: Math.min(concurrency, nodes.length) }, worker));
+				if (blocked) await persistSnapshot();
 
-			await writeJsonAtomically(manifestPath, nodes.flatMap((node) => node.artifacts));
-			snapshot.run.state = results.some((node) => node.state === "cancelled")
+				while (active.length < concurrency) {
+					const index = nodes.findIndex((node, candidate) => node.state === "queued"
+						&& node.blockedBy === undefined
+						&& preparedNodes[candidate]!.node.dependencies.every((id) => nodes[indexById.get(id)!]!.state === "completed"));
+					if (index < 0) break;
+					active.push({ index, execution: executeNode(index) });
+				}
+
+				if (active.length === 0) break;
+				const settled = await Promise.race(active.map(async ({ index, execution }) => ({ index, view: await execution })));
+				results[settled.index] = settled.view;
+				active = active.filter((candidate) => candidate.index !== settled.index);
+			}
+
+			const finalNodes = nodes.map((node, index) => results[index] ?? toNodeView(node));
+			snapshot.run.state = finalNodes.some((node) => node.state === "cancelled")
 				? "cancelled"
-				: results.every((node) => node.state === "completed") ? "completed" : "failed";
+				: finalNodes.every((node) => node.state === "completed") ? "completed" : "failed";
+			const graphArtifact: Artifact = { kind: "graph-result", path: join(runDirectory, "artifacts", "graph-result.json") };
+			const artifacts = [...nodes.flatMap((node) => node.artifacts), graphArtifact];
+			const finalNode = finalNodes.at(-1)!;
+			const aggregate: LaunchResult = {
+				run: { ...snapshot.run },
+				nodes: finalNodes,
+				...(finalNode.result?.state === "completed" ? { finalOutput: finalNode.result.output } : {}),
+				trace: finalNodes.map((node, index) => ({
+					nodeId: node.id,
+					logicalRole: node.logicalRole,
+					state: node.state,
+					predecessorIds: [...preparedNodes[index]!.node.dependencies],
+					...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}),
+				})),
+				artifacts,
+				handoffs: [...handoffs].sort((left, right) => indexById.get(left.nodeId)! - indexById.get(right.nodeId)!),
+			};
+			await writeJsonAtomically(graphArtifact.path, aggregate);
+			await writeJsonAtomically(manifestPath, artifacts);
 			await persistSnapshot();
-			return { run: { ...snapshot.run }, nodes: results };
+			return aggregate;
 		})();
 
 		if (launchOptions?.delivery === "blocking") return execution;
 
 		ownedDetachedRuns.set(runId, execution);
+		// A detached receipt must observe the queued nodes as running before it returns.
+		await snapshotWrite;
 		// Detached callers may never join; retain rejection handling for storage failures.
 		void execution.catch(() => undefined);
 		return { run: { ...snapshot.run } };
@@ -383,17 +516,79 @@ function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly
 }
 
 export const DEFAULT_MAX_CONCURRENCY = 6;
+/** Large handoffs remain complete on disk and enter child context by explicit path. */
+export const MAX_INLINE_HANDOFF_BYTES = 50 * 1024;
 
 function immutableGraphDefinition(graph: GraphDefinition): NormalizedGraph {
 	const definitions = graph.kind === "single" ? [graph.node] : graph.nodes;
 	if (!Array.isArray(definitions)) throw new Error("Graph nodes must be an array");
-	const nodes = Object.freeze(definitions.map(immutableNodeDefinition));
+
+	const nodes = graph.kind === "dag"
+		? definitions.map((node) => {
+				const dagNode = node as Readonly<DagNodeDefinition>;
+				const { id, dependsOn = [], ...definition } = dagNode;
+				return immutableNormalizedNode(id, definition, dependsOn);
+			})
+		: definitions.map((definition, index) => immutableNormalizedNode(
+			`node-${index + 1}`,
+			definition,
+			graph.kind === "chain" && index > 0 ? [`node-${index}`] : [],
+		));
+	validateGraph(nodes);
 	return Object.freeze({
-		nodes,
-		...(graph.kind === "parallel" && graph.maxConcurrency !== undefined
+		nodes: Object.freeze(nodes),
+		...(graph.kind !== "single" && graph.maxConcurrency !== undefined
 			? { maxConcurrency: graph.maxConcurrency }
 			: {}),
 	});
+}
+
+function immutableNormalizedNode(
+	id: string,
+	definition: Readonly<NodeDefinition>,
+	dependencies: readonly string[],
+): NormalizedNode {
+	return Object.freeze({
+		id,
+		definition: immutableNodeDefinition(definition),
+		dependencies: Object.freeze([...dependencies]),
+	});
+}
+
+function validateGraph(nodes: readonly NormalizedNode[]): void {
+	const ids = new Set<string>();
+	for (const node of nodes) {
+		if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(node.id)) {
+			throw new Error(`Invalid node ID: ${node.id}`);
+		}
+		if (ids.has(node.id)) throw new Error(`Duplicate node ID: ${node.id}`);
+		ids.add(node.id);
+	}
+	for (const node of nodes) {
+		const dependencies = new Set<string>();
+		for (const dependency of node.dependencies) {
+			if (!ids.has(dependency)) throw new Error(`Unknown predecessor ${dependency} for node ${node.id}`);
+			if (!dependencies.add(dependency)) throw new Error(`Duplicate predecessor ${dependency} for node ${node.id}`);
+		}
+	}
+
+	const remainingDependencies = new Map(nodes.map((node) => [node.id, node.dependencies.length]));
+	const dependents = new Map(nodes.map((node) => [node.id, [] as string[]]));
+	for (const node of nodes) {
+		for (const dependency of node.dependencies) dependents.get(dependency)!.push(node.id);
+	}
+	const ready = nodes.filter((node) => node.dependencies.length === 0).map((node) => node.id);
+	let visited = 0;
+	while (ready.length > 0) {
+		const id = ready.shift()!;
+		visited += 1;
+		for (const dependent of dependents.get(id)!) {
+			const remaining = remainingDependencies.get(dependent)! - 1;
+			remainingDependencies.set(dependent, remaining);
+			if (remaining === 0) ready.push(dependent);
+		}
+	}
+	if (visited !== nodes.length) throw new Error("Graph must be acyclic");
 }
 
 function validateNodeDefinition(definition: Readonly<NodeDefinition>): void {
@@ -497,6 +692,7 @@ function toNodeView(node: StoredNode, result?: NodeResult): NodeView {
 		state: node.state,
 		policy: node.policy,
 		artifacts: [...node.artifacts],
+		...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}),
 		usage: node.usage,
 		...(result ? { result } : {}),
 	};
@@ -516,9 +712,13 @@ async function writeSnapshot(runDirectory: string, snapshot: StoredSnapshot): Pr
 }
 
 async function writeJsonAtomically(path: string, value: unknown): Promise<void> {
+	await writeTextAtomically(path, JSON.stringify(value));
+}
+
+async function writeTextAtomically(path: string, value: string): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	const temporaryPath = `${path}.${randomUUID()}.tmp`;
-	await writeFile(temporaryPath, JSON.stringify(value), "utf8");
+	await writeFile(temporaryPath, value, "utf8");
 	await rename(temporaryPath, path);
 }
 

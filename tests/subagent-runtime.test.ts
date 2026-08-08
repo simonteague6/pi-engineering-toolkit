@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createSubagentRuntime,
+	MAX_INLINE_HANDOFF_BYTES,
 	SubprocessJsonRunner,
 	type ChildRunner,
 	type ChildRunnerRequest,
@@ -700,6 +701,235 @@ describe("subagent runtime", () => {
 			expect(result).toMatchObject({ state: "completed", output: "" });
 		});
 	});
+	test("routes a complete durable predecessor handoff through an ordered chain", async () => {
+		const requests: ChildRunnerRequest[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				requests.push(request);
+				return { state: "completed", output: request.logicalRole === "Research" ? "Repository facts." : "Implemented." };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = await runtime.launch({
+				kind: "chain",
+				nodes: [
+					{ agent: "worker", logicalRole: "Research", task: "Inspect the repository." },
+					{ agent: "worker", logicalRole: "Implement", task: "Use the report to implement the change." },
+				],
+			}, { delivery: "blocking" });
+
+			expect(requests.map((request) => request.task)).toEqual([
+				"Inspect the repository.",
+				"Use the report to implement the change.\n\n## Output from node-1\nRepository facts.",
+			]);
+			expect(launch.finalOutput).toBe("Implemented.");
+			expect(launch.handoffs).toEqual([expect.objectContaining({
+				nodeId: "node-2",
+				predecessorIds: ["node-1"],
+			})]);
+		});
+	});
+
+	test("normalizes single and one-node parallel forms to the same stable public graph", async () => {
+		const requests: ChildRunnerRequest[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				requests.push(request);
+				return { state: "completed", output: "done" };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const single = await runtime.launch(singleNode("Inspect once."), { delivery: "blocking" });
+			const parallel = await runtime.launch({
+				kind: "parallel",
+				nodes: [{ agent: "worker", logicalRole: "Recon", task: "Inspect once." }],
+			}, { delivery: "blocking" });
+			const chain = await runtime.launch({
+				kind: "chain",
+				nodes: [{ agent: "worker", logicalRole: "Recon", task: "Inspect once." }],
+			}, { delivery: "blocking" });
+			const dag = await runtime.launch({
+				kind: "dag",
+				nodes: [{ id: "node-1", agent: "worker", logicalRole: "Recon", task: "Inspect once." }],
+			}, { delivery: "blocking" });
+
+			expect(single.trace).toEqual(parallel.trace);
+			expect(single.trace).toEqual(chain.trace);
+			expect(single.trace).toEqual(dag.trace);
+			expect(single.nodes.map((node) => node.id)).toEqual(["node-1"]);
+			expect(requests.map((request) => request.nodeId)).toEqual(["node-1", "node-1", "node-1", "node-1"]);
+		});
+	});
+
+	test("routes DAG fan-in in declaration order and exposes complete graph evidence", async () => {
+		const requests: ChildRunnerRequest[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				requests.push(request);
+				return { state: "completed", output: `${request.logicalRole} result` };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "research", agent: "worker", logicalRole: "Research", task: "Research." },
+					{ id: "review", agent: "worker", logicalRole: "Review", task: "Review." },
+					{ id: "merge", agent: "worker", logicalRole: "Merge", task: "Merge.", dependsOn: ["review", "research"] },
+				],
+			}, { delivery: "blocking" });
+
+			expect(requests[2]!.task).toBe("Merge.\n\n## Output from research\nResearch result\n\n## Output from review\nReview result");
+			expect(launch.finalOutput).toBe("Merge result");
+			expect(launch.trace).toEqual([
+				{ nodeId: "research", logicalRole: "Research", state: "completed", predecessorIds: [] },
+				{ nodeId: "review", logicalRole: "Review", state: "completed", predecessorIds: [] },
+				{ nodeId: "merge", logicalRole: "Merge", state: "completed", predecessorIds: ["review", "research"] },
+			]);
+			expect(launch.handoffs).toEqual([expect.objectContaining({
+				nodeId: "merge",
+				predecessorIds: ["research", "review"],
+				predecessorArtifacts: [{ kind: "result", path: expect.any(String) }, { kind: "result", path: expect.any(String) }],
+				artifact: { kind: "handoff", path: expect.any(String) },
+				delivery: "inline",
+			})]);
+			expect(launch.artifacts).toContainEqual({ kind: "graph-result", path: expect.any(String) });
+		});
+	});
+
+	test("keeps node artifacts separate from the graph aggregate artifact", async () => {
+		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "node result" }) };
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = await runtime.launch({
+				kind: "dag",
+				nodes: [{ id: "graph-result", agent: "worker", logicalRole: "Named node", task: "Run." }],
+			}, { delivery: "blocking" });
+
+			expect(await runtime.result(launch.run.id, "graph-result")).toMatchObject({ state: "completed", output: "node result" });
+		});
+	});
+
+	test("keeps empty predecessor output and routes oversized handoffs by artifact path", async () => {
+		const requests: ChildRunnerRequest[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				requests.push(request);
+				const output = request.logicalRole === "Empty"
+					? ""
+					: request.logicalRole === "Large" ? "x".repeat(MAX_INLINE_HANDOFF_BYTES + 1) : "done";
+				return { state: "completed", output };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const empty = await runtime.launch({
+				kind: "chain",
+				nodes: [
+					{ agent: "worker", logicalRole: "Empty", task: "Return no text." },
+					{ agent: "worker", logicalRole: "Consumes empty", task: "Use empty." },
+				],
+			}, { delivery: "blocking" });
+			const oversized = await runtime.launch({
+				kind: "chain",
+				nodes: [
+					{ agent: "worker", logicalRole: "Large", task: "Return much text." },
+					{ agent: "worker", logicalRole: "Consumes large", task: "Use large." },
+				],
+			}, { delivery: "blocking" });
+
+			expect(requests[1]!.task).toBe("Use empty.\n\n## Output from node-1\n");
+			expect(oversized.handoffs[0]).toMatchObject({ delivery: "artifact", artifact: { path: expect.any(String) } });
+			expect(requests[3]!.task).toMatch(/## Required predecessor handoff\nThe complete predecessor handoff is stored at: .+\/handoffs\/.+\.txt/);
+			expect(requests[3]!.task).not.toContain("x".repeat(MAX_INLINE_HANDOFF_BYTES + 1));
+			expect(empty.nodes[1]!.state).toBe("completed");
+		});
+	});
+
+	test("rejects invalid DAG edges and cycles before any child starts", async () => {
+		let calls = 0;
+		const runner: ChildRunner = { run: async () => { calls += 1; return { state: "completed", output: "unexpected" }; } };
+
+		await withRuntime(runner, async (runtime) => {
+			await expect(runtime.launch({
+				kind: "dag",
+				nodes: [{ id: "one", agent: "worker", logicalRole: "One", task: "One", dependsOn: ["missing"] }],
+			})).rejects.toThrow("Unknown predecessor missing for node one");
+			await expect(runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "same", agent: "worker", logicalRole: "One", task: "One" },
+					{ id: "same", agent: "worker", logicalRole: "Two", task: "Two" },
+				],
+			})).rejects.toThrow("Duplicate node ID: same");
+			await expect(runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "one", agent: "worker", logicalRole: "One", task: "One", dependsOn: ["two"] },
+					{ id: "two", agent: "worker", logicalRole: "Two", task: "Two", dependsOn: ["one"] },
+				],
+			})).rejects.toThrow("Graph must be acyclic");
+		});
+
+		expect(calls).toBe(0);
+	});
+
+	test("blocks failed DAG descendants while unrelated branches continue", async () => {
+		const started: string[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				started.push(request.logicalRole);
+				if (request.logicalRole === "Fails") return { state: "failed", error: { kind: "execution", message: "expected" } };
+				return { state: "completed", output: `${request.logicalRole} result` };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "fails", agent: "worker", logicalRole: "Fails", task: "Fail." },
+					{ id: "blocked", agent: "worker", logicalRole: "Blocked", task: "Never run.", dependsOn: ["fails"] },
+					{ id: "continues", agent: "worker", logicalRole: "Continues", task: "Continue." },
+				],
+			}, { delivery: "blocking" });
+
+			expect(started).toEqual(["Fails", "Continues"]);
+			expect(launch.nodes.map((node) => node.state)).toEqual(["failed", "queued", "completed"]);
+			expect(launch.nodes[1]!.blockedBy).toEqual(["fails"]);
+			expect(launch.trace[1]).toEqual({ nodeId: "blocked", logicalRole: "Blocked", state: "queued", predecessorIds: ["fails"], blockedBy: ["fails"] });
+		});
+	});
+
+	test("blocks descendants of a cancelled predecessor", async () => {
+		const started: string[] = [];
+		const runner: ChildRunner = {
+			run: async (request) => {
+				started.push(request.logicalRole);
+				return request.logicalRole === "Cancelled"
+					? { state: "cancelled", error: { kind: "cancelled", message: "stopped" } }
+					: { state: "completed", output: "unexpected" };
+			},
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const launch = await runtime.launch({
+				kind: "dag",
+				nodes: [
+					{ id: "cancelled", agent: "worker", logicalRole: "Cancelled", task: "Stop." },
+					{ id: "blocked", agent: "worker", logicalRole: "Blocked", task: "Never run.", dependsOn: ["cancelled"] },
+				],
+			}, { delivery: "blocking" });
+
+			expect(started).toEqual(["Cancelled"]);
+			expect(launch.run.state).toBe("cancelled");
+			expect(launch.nodes[1]).toMatchObject({ state: "queued", blockedBy: ["cancelled"] });
+		});
+	});
+
 	test("returns failed status with durable error evidence", async () => {
 		const runner: ChildRunner = {
 			run: async () => ({
