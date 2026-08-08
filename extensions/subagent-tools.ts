@@ -10,6 +10,7 @@ import {
 	type LaunchOptions,
 	type LaunchReceipt,
 	type LaunchResult,
+	type ParentNotification,
 	type RecoveryPlan,
 	type RunView,
 	type StatusView,
@@ -80,7 +81,7 @@ const recoverSchema = Type.Object({
 });
 
 export type SubagentTool<TParams extends TSchema = TSchema> = ToolDefinition<TParams, SubagentToolDetails>;
-export type SubagentToolRuntimeContext = Pick<ExtensionContext, "cwd" | "modelRegistry">;
+export type SubagentToolRuntimeContext = Pick<ExtensionContext, "cwd" | "modelRegistry" | "sessionManager" | "isIdle">;
 export type SubagentRuntimeFactory = (ctx: SubagentToolRuntimeContext) => SubagentRuntime;
 
 export interface SubagentToolDetails {
@@ -119,7 +120,7 @@ type RunIdInput = Static<typeof runIdSchema>;
 type CancelInput = Static<typeof cancelSchema>;
 type RecoverInput = Static<typeof recoverSchema>;
 
-type ToolContext = Pick<ExtensionContext, "cwd" | "modelRegistry">;
+type ToolContext = SubagentToolRuntimeContext;
 
 /** Registers the parent-facing adapter against a runtime provider. */
 export function registerSubagentTools(pi: ExtensionAPI, runtimeFactory: SubagentRuntimeFactory): void {
@@ -439,29 +440,90 @@ async function withParentCancellation<T>(
 
 interface RuntimeOwner {
 	factory: SubagentRuntimeFactory;
+	bind: (ctx: ToolContext) => void;
+	flush: () => Promise<void>;
 	dispose: () => Promise<void>;
 }
 
-function defaultRuntimeOwner(): RuntimeOwner {
+const SUBAGENT_NOTIFICATION_TYPE = "subagent-parent-notification";
+
+function defaultRuntimeOwner(pi: ExtensionAPI): RuntimeOwner {
 	let runtime: SubagentRuntime | undefined;
+	let context: ToolContext | undefined;
+	let flushing = false;
+	let scheduled = false;
+
+	const flush = async (): Promise<void> => {
+		scheduled = false;
+		if (flushing || !runtime || !context || !context.isIdle()) return;
+		const notifications = await runtime.notifications();
+		if (notifications.length === 0) return;
+		flushing = true;
+		try {
+			const content = formatParentNotifications(notifications);
+			await Promise.resolve(pi.sendMessage({
+				customType: SUBAGENT_NOTIFICATION_TYPE,
+				content,
+				display: true,
+				details: { notifications },
+			}, { triggerTurn: true, deliverAs: "followUp" }));
+			await runtime.acknowledgeNotifications(notifications.map((notification) => notification.id));
+		} finally {
+			flushing = false;
+		}
+	};
+	const scheduleFlush = (): void => {
+		if (scheduled) return;
+		scheduled = true;
+		queueMicrotask(() => { void flush(); });
+	};
+	const bind = (ctx: ToolContext): void => {
+		context = ctx;
+		if (runtime) {
+			scheduleFlush();
+			return;
+		}
+		const parentSessionId = ctx.sessionManager.getSessionFile() ?? `ephemeral:${ctx.cwd}`;
+		runtime = createSubagentRuntime({
+			cwd: ctx.cwd,
+			parentSessionId,
+			modelCatalog: { isAvailable: (provider, model) => ctx.modelRegistry.find(provider, model) !== undefined },
+			onParentNotifications: () => scheduleFlush(),
+		});
+		scheduleFlush();
+	};
 	return {
-		factory: (ctx: ToolContext) => {
-			runtime ??= createSubagentRuntime({
-				cwd: ctx.cwd,
-				modelCatalog: { isAvailable: (provider, model) => ctx.modelRegistry.find(provider, model) !== undefined },
-			});
-			return runtime;
+		factory: (ctx) => {
+			bind(ctx);
+			return runtime!;
 		},
+		bind,
+		flush,
 		dispose: async () => {
 			const activeRuntime = runtime;
 			runtime = undefined;
+			context = undefined;
 			await activeRuntime?.dispose();
 		},
 	};
 }
 
+function formatParentNotifications(notifications: readonly ParentNotification[]): string {
+	const lines = [`Subagent notifications (${notifications.length}):`];
+	for (const notification of notifications) {
+		const subject = notification.nodeId
+			? `${notification.runId}/${notification.nodeId}${notification.logicalRole ? ` (${notification.logicalRole})` : ""}`
+			: notification.runId;
+		const artifacts = notification.artifactPaths.length > 0 ? ` Evidence: ${notification.artifactPaths.join(", ")}` : "";
+		lines.push(`- [${notification.kind}] ${subject}: ${notification.message}.${artifacts}`);
+	}
+	return lines.join("\n");
+}
+
 export default function subagentToolsExtension(pi: ExtensionAPI): void {
-	const owner = defaultRuntimeOwner();
+	const owner = defaultRuntimeOwner(pi);
 	registerSubagentTools(pi, owner.factory);
+	pi.on("session_start", (_event, ctx) => owner.bind(ctx));
+	pi.on("agent_settled", (_event, ctx) => { owner.bind(ctx); void owner.flush(); });
 	pi.on("session_shutdown", owner.dispose);
 }

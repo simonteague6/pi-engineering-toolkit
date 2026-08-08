@@ -232,6 +232,25 @@ export interface LaunchReceipt {
 	run: RunView;
 }
 
+export type ParentNotificationKind = "node-failure" | "node-cancellation" | "graph-suspension" | "graph-result";
+
+/** Compact durable evidence queued for the parent session. */
+export interface ParentNotification {
+	id: string;
+	parentSessionId: string;
+	runId: string;
+	kind: ParentNotificationKind;
+	state: Extract<LifecycleState, "failed" | "cancelled" | "suspended" | "completed">;
+	nodeId?: string;
+	logicalRole?: string;
+	message: string;
+	artifactPaths: readonly string[];
+	createdAt: number;
+	deliveredAt?: number;
+}
+
+export type ParentNotificationListener = (notifications: readonly ParentNotification[]) => void | Promise<void>;
+
 export interface LaunchOptions {
 	/** Detached execution is the default; blocking returns the terminal node result. */
 	delivery?: "detached" | "blocking";
@@ -279,6 +298,10 @@ export interface ModelCatalog {
 export interface SubagentRuntimeOptions {
 	/** Isolated-store override for tests; normal callers use the package-owned Pi store. */
 	storeDirectory?: string;
+	/** Stable parent-session key used to scope queued notifications. */
+	parentSessionId?: string;
+	/** Called after a notification is durably queued. It must not interrupt an active parent turn. */
+	onParentNotifications?: ParentNotificationListener;
 	/** Terminal run-data retention; defaults to 30 days. */
 	retentionPeriodMs?: number;
 	runner?: ChildRunner;
@@ -319,6 +342,12 @@ export interface SubagentRuntime {
 	cleanup(): Promise<CleanupResult>;
 	events(runId: string): Promise<LifecycleEvent[]>;
 	result(runId: string, nodeId: string): Promise<NodeResult>;
+	/** Returns undelivered notifications for this runtime's parent session. */
+	notifications(): Promise<ParentNotification[]>;
+	/** Marks individual notification records delivered without deleting their evidence. */
+	acknowledgeNotifications(notificationIds: readonly string[]): Promise<void>;
+	/** Subscribes to newly queued notifications. The returned function removes the listener. */
+	subscribeNotifications(listener: ParentNotificationListener): () => void;
 }
 
 interface StoredNode {
@@ -335,9 +364,15 @@ interface StoredNode {
 
 interface StoredSnapshot {
 	run: RunView;
+	parentSessionId: string;
+	delivery: "detached" | "blocking";
 	nodes: StoredNode[];
 	idleLimitMs: number;
 	terminalAt?: number;
+}
+
+interface StoredNotificationFile {
+	notifications: ParentNotification[];
 }
 
 interface RunControl {
@@ -358,8 +393,12 @@ interface RunControl {
  */
 export function createSubagentRuntime(options: SubagentRuntimeOptions): SubagentRuntime {
 	const storeDirectory = options.storeDirectory ?? defaultRunStoreDirectory();
+	const parentSessionId = options.parentSessionId ?? "default";
+	if (!parentSessionId.trim()) throw new Error("Parent session ID must not be empty");
 	const runner = options.runner ?? new SubprocessJsonRunner();
 	const executions = new Map<string, Promise<LaunchResult>>();
+	const notificationListeners = new Set<ParentNotificationListener>(options.onParentNotifications ? [options.onParentNotifications] : []);
+	const notificationWrites = new Map<string, Promise<void>>();
 	const controls = new Map<string, RunControl>();
 	const clock = options.clock ?? systemClock;
 	const defaultIdleLimitMs = options.idleLimitMs ?? DEFAULT_IDLE_LIMIT_MS;
@@ -401,6 +440,26 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const nodeViews = new Map<number, NodeView>();
 		let snapshotWrite = Promise.resolve();
 		let eventWrite = Promise.resolve();
+		let pendingNotifications: ParentNotification[] = [];
+		const queueNotification = async (notification: Omit<ParentNotification, "id" | "parentSessionId" | "createdAt" | "runId">): Promise<void> => {
+			if (snapshot.delivery !== "detached") return;
+			const record: ParentNotification = {
+				...notification,
+				runId,
+				id: `notification_${randomUUID()}`,
+				parentSessionId: snapshot.parentSessionId,
+				createdAt: clock.now(),
+				artifactPaths: [...notification.artifactPaths],
+			};
+			pendingNotifications = [...pendingNotifications, record];
+			const write = (notificationWrites.get(runId) ?? Promise.resolve()).then(async () => {
+				await writeJsonAtomically(join(runDirectory, "notifications.json"), { notifications: pendingNotifications });
+			});
+			notificationWrites.set(runId, write);
+			await write;
+			const queued = await listNotificationsForSession(storeDirectory, snapshot.parentSessionId);
+			for (const listener of notificationListeners) void Promise.resolve(listener(queued)).catch(() => undefined);
+		};
 		const persistSnapshot = (): Promise<void> => {
 			const write = snapshotWrite.then(() => writeSnapshot(runDirectory, snapshot));
 			snapshotWrite = write;
@@ -452,7 +511,17 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			node.artifacts = [...node.artifacts, { kind: state === "suspended" ? "checkpoint" : "failure", path: resultPath }];
 			node.state = state;
 			nodeViews.set(index, toNodeView(node, result));
-			await record(state, node.id, state === "failed" && error.kind === "timeout" ? "timeout" : state);
+			await record(state, node.id, state === "failed" ? (error.kind === "timeout" ? "timeout" : undefined) : state);
+			if (state === "failed" || state === "cancelled") {
+				await queueNotification({
+					kind: state === "failed" ? "node-failure" : "node-cancellation",
+					state,
+					nodeId: node.id,
+					logicalRole: node.logicalRole,
+					message: boundedNotificationText(error.message),
+					artifactPaths: [resultPath],
+				});
+			}
 		};
 		control.apply = async (mode, nodeIds) => {
 			if (control.mode !== "running" && mode !== "suspending" && !(mode === "timing-out" && !control.haltScheduling)) return;
@@ -561,6 +630,16 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			const view = toNodeView(node, result);
 			nodeViews.set(index, view);
 			await record(state, node.id, state === "failed" && error?.kind === "timeout" ? "timeout" : state === "suspended" ? "suspended" : state === "cancelled" ? "cancelled" : undefined);
+			if (state === "failed" || state === "cancelled") {
+				await queueNotification({
+					kind: state === "failed" ? "node-failure" : "node-cancellation",
+					state,
+					nodeId: node.id,
+					logicalRole: node.logicalRole,
+					message: boundedNotificationText(error?.message ?? `Node ${node.id} ${state}`),
+					artifactPaths: [resultPath],
+				});
+			}
 			await persistSnapshot();
 			return view;
 		};
@@ -620,9 +699,25 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		};
 		await writeJsonAtomically(graphArtifact.path, aggregate);
 		await writeJsonAtomically(manifestPath, artifacts);
+		if (snapshot.run.state === "completed") {
+			await queueNotification({
+				kind: "graph-result",
+				state: "completed",
+				message: `Run ${runId} completed`,
+				artifactPaths: [graphArtifact.path],
+			});
+		} else if (snapshot.run.state === "suspended") {
+			await queueNotification({
+				kind: "graph-suspension",
+				state: "suspended",
+				message: `Run ${runId} suspended`,
+				artifactPaths: [graphArtifact.path],
+			});
+		}
 		await record(snapshot.run.state);
 		await persistSnapshot();
 		await eventWrite;
+		notificationWrites.delete(runId);
 		controls.delete(runId);
 		return aggregate;
 	};
@@ -648,7 +743,10 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const runId = `run_${randomUUID()}`;
 		const runDirectory = join(storeDirectory, "runs", runId);
 		const snapshot: StoredSnapshot = {
-			run: { id: runId, state: "running" }, idleLimitMs,
+			run: { id: runId, state: "running" },
+			parentSessionId,
+			delivery: launchOptions?.delivery === "blocking" ? "blocking" : "detached",
+			idleLimitMs,
 			nodes: prepared.map(({ node, policy }) => ({ id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] })),
 		};
 		await writeJsonAtomically(join(runDirectory, "graph.json"), graph);
@@ -686,6 +784,8 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const sourceById = new Map(sourceSnapshot.nodes.map((node) => [node.id, node]));
 		const snapshot: StoredSnapshot = {
 			run: { id: runId, state: "running", lineage },
+			parentSessionId,
+			delivery: launchOptions?.delivery === "blocking" ? "blocking" : "detached",
 			idleLimitMs,
 			nodes: prepared.map(({ node, policy }) => {
 				const sourceNode = sourceById.get(node.id)!;
@@ -773,7 +873,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 				}
 				try {
 					const snapshot = await readSnapshot(storeDirectory, runId);
-					if (!isTerminal(snapshot.run.state) || snapshot.terminalAt === undefined || clock.now() < snapshot.terminalAt + retentionPeriodMs) {
+					if (!isTerminal(snapshot.run.state) || snapshot.terminalAt === undefined || clock.now() < snapshot.terminalAt + retentionPeriodMs || await hasUndeliveredNotifications(join(runsDirectory, runId))) {
 						preservedRunIds.push(runId);
 						continue;
 					}
@@ -793,6 +893,15 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			if (!node) throw new Error(`Unknown node: ${nodeId}`);
 			if (!node.resultPath) throw new Error(`Node ${nodeId} has no durable result`);
 			return JSON.parse(await readFile(node.resultPath, "utf8")) as NodeResult;
+		},
+		notifications: () => listNotificationsForSession(storeDirectory, parentSessionId),
+		acknowledgeNotifications: async (notificationIds) => {
+			await Promise.all([...notificationWrites.values()]);
+			await acknowledgeNotifications(storeDirectory, parentSessionId, notificationIds, clock.now());
+		},
+		subscribeNotifications: (listener) => {
+			notificationListeners.add(listener);
+			return () => notificationListeners.delete(listener);
 		},
 	};
 }
@@ -1121,11 +1230,92 @@ async function readEvents(storeDirectory: string, runId: string): Promise<Lifecy
 
 async function readSnapshot(storeDirectory: string, runId: string): Promise<StoredSnapshot> {
 	try {
-		return JSON.parse(await readFile(join(storeDirectory, "runs", runId, "snapshot.json"), "utf8")) as StoredSnapshot;
+		const snapshot = JSON.parse(await readFile(join(storeDirectory, "runs", runId, "snapshot.json"), "utf8")) as Partial<StoredSnapshot> & Pick<StoredSnapshot, "run" | "nodes" | "idleLimitMs">;
+		return {
+			...snapshot,
+			parentSessionId: snapshot.parentSessionId ?? "default",
+			delivery: snapshot.delivery ?? "detached",
+		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Unknown run: ${runId}`);
 		throw error;
 	}
+}
+
+async function hasUndeliveredNotifications(runDirectory: string): Promise<boolean> {
+	try {
+		const stored = JSON.parse(await readFile(join(runDirectory, "notifications.json"), "utf8")) as StoredNotificationFile;
+		return stored.notifications.some((notification) => notification.deliveredAt === undefined);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function listNotificationsForSession(storeDirectory: string, parentSessionId: string): Promise<ParentNotification[]> {
+	let runIds: string[];
+	try {
+		runIds = await readdir(join(storeDirectory, "runs"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	const notifications: ParentNotification[] = [];
+	for (const runId of runIds) {
+		try {
+			const stored = JSON.parse(await readFile(join(storeDirectory, "runs", runId, "notifications.json"), "utf8")) as StoredNotificationFile;
+			for (const notification of stored.notifications) {
+				if (notification.parentSessionId === parentSessionId && notification.deliveredAt === undefined) notifications.push(notification);
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+	}
+	return notifications.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+}
+
+async function acknowledgeNotifications(
+	storeDirectory: string,
+	parentSessionId: string,
+	notificationIds: readonly string[],
+	deliveredAt: number,
+): Promise<void> {
+	const ids = new Set(notificationIds);
+	if (ids.size === 0) return;
+	let runIds: string[];
+	try {
+		runIds = await readdir(join(storeDirectory, "runs"));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	for (const runId of runIds) {
+		const path = join(storeDirectory, "runs", runId, "notifications.json");
+		try {
+			const stored = JSON.parse(await readFile(path, "utf8")) as StoredNotificationFile;
+			let changed = false;
+			const notifications = stored.notifications.map((notification) => {
+				if (ids.has(notification.id) && notification.parentSessionId === parentSessionId && notification.deliveredAt === undefined) {
+					changed = true;
+					return { ...notification, deliveredAt };
+				}
+				return notification;
+			});
+			if (changed) await writeJsonAtomically(path, { notifications });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+	}
+}
+
+function boundedNotificationText(value: string): string {
+	const maxBytes = 500;
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	let result = value.slice(0, maxBytes);
+	while (Buffer.byteLength(result, "utf8") > maxBytes - 16) result = result.slice(0, -1);
+	return `${result}…`;
 }
 
 async function writeSnapshot(runDirectory: string, snapshot: StoredSnapshot): Promise<void> {

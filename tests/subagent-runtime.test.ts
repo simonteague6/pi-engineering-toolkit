@@ -469,6 +469,132 @@ describe("subagent runtime", () => {
 		});
 	});
 
+	test("queues one compact final notification for detached success and keeps it after recreation", async () => {
+		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "private complete output" }) };
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({
+				storeDirectory,
+				parentSessionId: "session-parent",
+				runner,
+				modelCatalog: { isAvailable: () => true },
+			});
+			const receipt = await runtime.launch(singleNode());
+			await runtime.join(receipt.run.id);
+
+			const notifications = await runtime.notifications();
+			expect(notifications).toHaveLength(1);
+			expect(notifications[0]).toMatchObject({
+			parentSessionId: "session-parent",
+			runId: receipt.run.id,
+			kind: "graph-result",
+			state: "completed",
+			message: `Run ${receipt.run.id} completed`,
+		});
+			expect(notifications[0]!.artifactPaths[0]).toContain("graph-result.json");
+			expect(JSON.stringify(notifications)).not.toContain("private complete output");
+
+		const recreated = createSubagentRuntime({ storeDirectory, parentSessionId: "session-parent", runner, modelCatalog: { isAvailable: () => true } });
+		expect(await recreated.notifications()).toEqual(notifications);
+		await recreated.acknowledgeNotifications([notifications[0]!.id]);
+			expect(await recreated.notifications()).toEqual([]);
+		});
+	});
+
+	test("queues failures without successful internal completion notifications", async () => {
+		const runner: ChildRunner = {
+			run: async (request) => request.logicalRole === "Fails"
+				? { state: "failed", error: { kind: "execution", message: "provider failed", partialOutput: "private partial" } }
+				: { state: "completed", output: "sibling complete" },
+		};
+
+		await withRuntime(runner, async (runtime) => {
+			const result = await runtime.launch({
+				kind: "parallel",
+				nodes: [
+					{ agent: "worker", logicalRole: "Fails", task: "Fail" },
+					{ agent: "worker", logicalRole: "Succeeds", task: "Succeed" },
+				],
+			}, { delivery: "blocking" });
+			expect(result.run.state).toBe("failed");
+			expect(await runtime.notifications()).toEqual([]);
+		}, { parentSessionId: "blocking-parent" });
+
+		await withRuntime(runner, async (runtime) => {
+			const result = await runtime.launch({
+				kind: "parallel",
+				nodes: [
+					{ agent: "worker", logicalRole: "Fails", task: "Fail" },
+					{ agent: "worker", logicalRole: "Succeeds", task: "Succeed" },
+				],
+			});
+			await runtime.join(result.run.id);
+			const notifications = await runtime.notifications();
+			expect(notifications).toHaveLength(1);
+			expect(notifications[0]).toMatchObject({ kind: "node-failure", logicalRole: "Fails", state: "failed" });
+			expect(JSON.stringify(notifications)).not.toContain("private partial");
+		});
+	});
+
+	test("keeps busy-parent notifications queued, then batches them on the next idle turn", async () => {
+		let parentBusy = true;
+		const delivered: Array<{ ids: string[]; userRequestWasPrimary: boolean }> = [];
+		let runtimeForListener: ReturnType<typeof createSubagentRuntime>;
+		const flush = async () => {
+			if (parentBusy) return;
+			const notifications = await runtimeForListener.notifications();
+			if (notifications.length === 0) return;
+			delivered.push({ ids: notifications.map(({ id }) => id), userRequestWasPrimary: true });
+			await runtimeForListener.acknowledgeNotifications(notifications.map(({ id }) => id));
+		};
+		const runner: ChildRunner = { run: async () => ({ state: "completed", output: "done" }) };
+
+		await withStore(async (storeDirectory) => {
+			runtimeForListener = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			runtimeForListener.subscribeNotifications(flush);
+			const first = await runtimeForListener.launch(singleNode("First"));
+			const second = await runtimeForListener.launch(singleNode("Second"));
+			await Promise.all([runtimeForListener.join(first.run.id), runtimeForListener.join(second.run.id)]);
+			await Promise.resolve();
+			expect(delivered).toEqual([]);
+			expect((await runtimeForListener.notifications()).map(({ kind }) => kind)).toEqual(["graph-result", "graph-result"]);
+
+			parentBusy = false;
+			await flush();
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]!.ids).toHaveLength(2);
+			expect(delivered[0]!.userRequestWasPrimary).toBe(true);
+			expect(await runtimeForListener.notifications()).toEqual([]);
+		});
+	});
+
+	test("creates a durable graph suspension notification for detached shutdown", async () => {
+		let started: (() => void) | undefined;
+		const running = new Promise<void>((resolve) => { started = resolve; });
+		const runner: ChildRunner = {
+			run: async (_request, options) => {
+				started!();
+				await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+				return { state: "cancelled", error: { kind: "cancelled", message: "shutdown" } };
+			},
+		};
+
+		await withStore(async (storeDirectory) => {
+			const runtime = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			const receipt = await runtime.launch(singleNode());
+			await started;
+			const disposing = runtime.dispose();
+			await disposing;
+			const notifications = await runtime.notifications();
+			expect(notifications).toHaveLength(1);
+			expect(notifications[0]).toMatchObject({
+				runId: receipt.run.id,
+				kind: "graph-suspension",
+				state: "suspended",
+			});
+		});
+	});
+
 	test("joins detached failures and rejects unknown or inaccessible runs", async () => {
 		const runner: ChildRunner = {
 			run: async () => ({
