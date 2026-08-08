@@ -26,6 +26,7 @@
 - **Native handoff** — Generate a durable handoff artifact and move into an idle replacement session with the context already available.
 - **Context visibility** — Show current context usage in the footer and warn when a session approaches context limits.
 - **Code-block clipboard picker** — Search fenced code blocks from completed assistant replies and copy the selected block to the system clipboard.
+- **Subagent control center** — Open `/subagents` to inspect current-session runs and edit definition-backed model defaults.
 
 ## Install
 
@@ -59,6 +60,10 @@ Restart pi, or run `/reload`, after installing. Use `pi list` to confirm that th
   - Linux: one of `wl-copy`, `xclip`, or `xsel`
 
 ## Usage
+
+### Subagents
+
+Run `/subagents` in TUI mode to open the full-screen control center. The Runs view shows current-session runs, node lifecycle states, dependency edges, available usage, and durable result details. Settings edits the selected agent definition directly; project definitions take precedence over user and packaged definitions.
 
 ### Profiles
 

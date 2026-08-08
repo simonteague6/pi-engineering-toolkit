@@ -5,7 +5,15 @@
   "keywords": ["pi-package"],
   "type": "module",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions/context-usage-meter.ts",
+      "./extensions/copy-code.ts",
+      "./extensions/current-context-size.ts",
+      "./extensions/handoff.ts",
+      "./extensions/profile.ts",
+      "./extensions/subagent-control-center.ts",
+      "./extensions/subagent-tools.ts"
+    ]
   },
   "devDependencies": {
     "typescript": "^5"

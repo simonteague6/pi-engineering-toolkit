@@ -22,6 +22,10 @@ export interface UsageRecord {
 	reasoning?: ReasoningLevel;
 	inputTokens?: TokenUsage;
 	outputTokens?: TokenUsage;
+	/** Provider-reported context size when the child exposes it. */
+	contextTokens?: number;
+	/** Provider-reported cost when the child exposes it. */
+	cost?: number;
 	durationMs?: number;
 }
 
@@ -185,6 +189,8 @@ export interface NodeView {
 	agent: string;
 	logicalRole: string;
 	state: LifecycleState;
+	/** Direct predecessor IDs, present for graph-aware status and TUI views. */
+	dependencies?: string[];
 	policy: ExecutionPolicy;
 	artifacts: Artifact[];
 	blockedBy?: string[];
@@ -275,6 +281,8 @@ export interface RuntimeClock {
 export interface UsageTotals {
 	inputTokens?: number;
 	outputTokens?: number;
+	contextTokens?: number;
+	cost?: number;
 	durationMs?: number;
 	/** Fields unavailable for one or more nodes; totals never estimate them. */
 	unavailable: readonly TokenUsageField[];
@@ -326,6 +334,8 @@ export interface SubagentRuntime {
 	launch(graph: GraphDefinition, options: { delivery: "detached" }): Promise<LaunchReceipt>;
 	launch(graph: GraphDefinition, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
+	/** Lists runs owned by the current parent session in stable ID order. */
+	runs(): Promise<StatusView[]>;
 	join(runId: string): Promise<LaunchResult>;
 	/** Cancels a whole run, or one node and its descendants. */
 	cancel(runId: string, nodeId?: string): Promise<LaunchResult>;
@@ -355,6 +365,7 @@ interface StoredNode {
 	agent: string;
 	logicalRole: string;
 	state: LifecycleState;
+	dependencies?: string[];
 	policy: ExecutionPolicy;
 	artifacts: Artifact[];
 	blockedBy?: string[];
@@ -747,7 +758,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			parentSessionId,
 			delivery: launchOptions?.delivery === "blocking" ? "blocking" : "detached",
 			idleLimitMs,
-			nodes: prepared.map(({ node, policy }) => ({ id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] })),
+			nodes: prepared.map(({ node, policy }) => ({ id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", dependencies: [...node.dependencies], policy, artifacts: [] })),
 		};
 		await writeJsonAtomically(join(runDirectory, "graph.json"), graph);
 		await writeSnapshot(runDirectory, snapshot);
@@ -796,7 +807,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 						...(sourceNode.blockedBy ? { blockedBy: [...sourceNode.blockedBy] } : {}),
 					};
 				}
-				return { id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", policy, artifacts: [] };
+				return { id: node.id, agent: node.definition.agent, logicalRole: node.definition.logicalRole, state: "queued", dependencies: [...node.dependencies], policy, artifacts: [] };
 			}),
 		};
 		const runDirectory = join(storeDirectory, "runs", runId);
@@ -815,6 +826,31 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 			const snapshot = await readSnapshot(storeDirectory, runId);
 			const usage = usageTotals(snapshot.nodes);
 			return { run: { ...snapshot.run }, nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })), ...(usage ? { usage } : {}) };
+		},
+		runs: async () => {
+			let runIds: string[];
+			try {
+				runIds = await readdir(join(storeDirectory, "runs"));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				throw error;
+			}
+			const statuses: StatusView[] = [];
+			for (const runId of runIds) {
+				try {
+					const snapshot = await readSnapshot(storeDirectory, runId);
+					if (snapshot.parentSessionId !== parentSessionId) continue;
+					const usage = usageTotals(snapshot.nodes);
+					statuses.push({
+						run: { ...snapshot.run },
+						nodes: snapshot.nodes.map(({ resultPath: _resultPath, ...node }) => ({ ...node })),
+						...(usage ? { usage } : {}),
+					});
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				}
+			}
+			return statuses.sort((left, right) => right.run.id.localeCompare(left.run.id));
 		},
 		join: async (runId) => {
 			await readSnapshot(storeDirectory, runId);
@@ -1182,6 +1218,7 @@ function toNodeView(node: StoredNode, result?: NodeResult): NodeView {
 		agent: node.agent,
 		logicalRole: node.logicalRole,
 		state: node.state,
+		...(node.dependencies ? { dependencies: [...node.dependencies] } : {}),
 		policy: node.policy,
 		artifacts: [...node.artifacts],
 		...(node.blockedBy ? { blockedBy: [...node.blockedBy] } : {}),
@@ -1348,6 +1385,8 @@ function resolvedUsage(
 		reasoning: policy.reasoning,
 		inputTokens: suppliedTokenCount(providerUsage?.inputTokens),
 		outputTokens: suppliedTokenCount(providerUsage?.outputTokens),
+		...(typeof providerUsage?.contextTokens === "number" ? { contextTokens: providerUsage.contextTokens } : {}),
+		...(typeof providerUsage?.cost === "number" ? { cost: providerUsage.cost } : {}),
 		durationMs: Math.max(0, durationMs),
 	};
 }
@@ -1367,6 +1406,8 @@ function usageTotals(nodes: readonly StoredNode[]): UsageTotals | undefined {
 			if (typeof value === "number") totals[field] = (totals[field] ?? 0) + value;
 			else unavailable.add(field);
 		}
+		if (usage.contextTokens !== undefined) totals.contextTokens = (totals.contextTokens ?? 0) + usage.contextTokens;
+		if (usage.cost !== undefined) totals.cost = (totals.cost ?? 0) + usage.cost;
 		if (usage.durationMs !== undefined) totals.durationMs = (totals.durationMs ?? 0) + usage.durationMs;
 	}
 	return Object.keys(totals).length > 0 || unavailable.size > 0
@@ -1423,9 +1464,9 @@ export class SubprocessJsonRunner implements ChildRunner {
 			let child: ReturnType<typeof spawn>;
 			try {
 				child = spawn(this.executable, args, {
-				cwd: request.cwd,
-				env: freshChildEnvironment(),
-				shell: false,
+					cwd: request.cwd,
+					env: freshChildEnvironment(),
+					shell: false,
 					stdio: ["ignore", "pipe", "pipe"],
 				});
 			} catch (error) {
@@ -1442,6 +1483,8 @@ export class SubprocessJsonRunner implements ChildRunner {
 			let model: string | undefined;
 			let inputTokens: number | undefined;
 			let outputTokens: number | undefined;
+			let contextTokens: number | undefined;
+			let cost: number | undefined;
 			let abortRequested = options.signal?.aborted ?? false;
 			let killTimer: ReturnType<typeof setTimeout> | undefined;
 			const abort = () => {
@@ -1449,6 +1492,10 @@ export class SubprocessJsonRunner implements ChildRunner {
 				child.kill("SIGTERM");
 				killTimer = setTimeout(() => child.kill("SIGKILL"), options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS);
 			};
+			if (!child.stdout || !child.stderr) {
+				reject(new Error("Child process did not expose piped stdout and stderr"));
+				return;
+			}
 			if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
 			if (abortRequested) abort();
 			// Until Pi reports agent or tool activity, a stalled child is idle.
@@ -1476,6 +1523,8 @@ export class SubprocessJsonRunner implements ChildRunner {
 				if (isRecord(event.message.usage)) {
 					inputTokens = numberValue(event.message.usage.input);
 					outputTokens = numberValue(event.message.usage.output);
+					contextTokens = numberValue(event.message.usage.totalTokens);
+					if (isRecord(event.message.usage.cost)) cost = numberValue(event.message.usage.cost.total);
 				}
 			};
 
@@ -1497,6 +1546,8 @@ export class SubprocessJsonRunner implements ChildRunner {
 					model,
 					inputTokens,
 					outputTokens,
+					contextTokens,
+					cost,
 					durationMs: Math.max(0, Date.now() - startedAt),
 				};
 				if (abortRequested || stopReason === "aborted") {
