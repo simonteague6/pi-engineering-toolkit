@@ -17,7 +17,6 @@ import {
 	controlCenterReducer,
 	controlCenterViewModel,
 	createControlCenterState,
-	type ControlCenterAction,
 	type ControlCenterState,
 	type ControlCenterSelection,
 } from "./subagent-control-center-model.ts";
@@ -25,9 +24,9 @@ import {
 const REFRESH_MS = 750;
 const CONTROL_CENTER_COMMAND = "subagents";
 
-type ViewAction = ControlCenterAction | { type: "close" } | { type: "open" };
+type ViewAction = { type: "close" } | { type: "open" };
 
-class ControlCenterComponent {
+export class ControlCenterComponent {
 	private state: ControlCenterState;
 	private refreshTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -36,6 +35,7 @@ class ControlCenterComponent {
 		state: ControlCenterState,
 		private readonly done: (action: ViewAction) => void,
 		private readonly onRefresh: (apply: (runs: readonly StatusView[]) => void) => void,
+		private readonly getHeight: () => number = () => 1,
 	) {
 		this.state = state;
 	}
@@ -55,15 +55,23 @@ class ControlCenterComponent {
 	handleInput(data: string): void {
 		if (matchesKey(data, Key.escape)) return this.done({ type: "close" });
 		if (matchesKey(data, Key.tab) || matchesKey(data, Key.left) || matchesKey(data, Key.right) || data === "h" || data === "l") {
-			return this.done({ type: "tab" });
+			this.state = controlCenterReducer(this.state, { type: "tab" });
+			return;
 		}
-		if (matchesKey(data, Key.up) || data === "k") return this.done({ type: "move", delta: -1 });
-		if (matchesKey(data, Key.down) || data === "j") return this.done({ type: "move", delta: 1 });
+		if (matchesKey(data, Key.up) || data === "k") {
+			this.state = controlCenterReducer(this.state, { type: "move", delta: -1 });
+			return;
+		}
+		if (matchesKey(data, Key.down) || data === "j") {
+			this.state = controlCenterReducer(this.state, { type: "move", delta: 1 });
+			return;
+		}
 		if (matchesKey(data, Key.enter)) return this.done({ type: "open" });
 	}
 
 	render(width: number): string[] {
 		const inner = Math.max(1, width - 2);
+		const height = Math.max(1, Math.floor(this.getHeight()));
 		const title = ` ${this.theme.fg("accent", this.theme.bold("SUBAGENTS"))}   ${this.tabLabel("runs", "Runs")}   ${this.tabLabel("settings", "Settings")}`;
 		const lines = [
 			this.theme.fg("borderAccent", `╭${"─".repeat(inner)}╮`),
@@ -76,7 +84,7 @@ class ControlCenterComponent {
 				: " ↑↓/jk select · enter edit defaults · tab/←→ runs · esc close", inner),
 			this.theme.fg("borderAccent", `╰${"─".repeat(inner)}╯`),
 		];
-		return lines.map((line) => truncateToWidth(line, width, ""));
+		return fillOverlayHeight(lines, height, this.frame("", inner)).map((line) => truncateToWidth(line, width, ""));
 	}
 
 	invalidate(): void {}
@@ -171,9 +179,16 @@ class ControlCenterComponent {
 }
 
 class DetailComponent {
-	constructor(private readonly theme: Theme, private readonly title: string, private readonly result: NodeResult | undefined, private readonly message: string) {}
+	constructor(
+		private readonly theme: Theme,
+		private readonly title: string,
+		private readonly result: NodeResult | undefined,
+		private readonly message: string,
+		private readonly getHeight: () => number = () => 1,
+	) {}
 	render(width: number): string[] {
 		const inner = Math.max(1, width - 2);
+		const height = Math.max(1, Math.floor(this.getHeight()));
 		const output = this.result?.output;
 		const body = output === undefined ? [this.theme.fg("warning", this.message)] : output.split("\n").slice(0, 80).map((line) => this.theme.fg("toolOutput", line));
 		const lines = [
@@ -186,7 +201,7 @@ class DetailComponent {
 			this.frame(" Esc/Enter close · output is durable result data, not a persisted transcript", inner),
 			this.theme.fg("borderAccent", `╰${"─".repeat(inner)}╯`),
 		];
-		return lines.map((line) => truncateToWidth(line, width, ""));
+		return fillOverlayHeight(lines, height, this.frame("", inner)).map((line) => truncateToWidth(line, width, ""));
 	}
 	handleInput(data: string, done: () => void): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) done();
@@ -196,6 +211,17 @@ class DetailComponent {
 		const content = truncateToWidth(value, width, "");
 		return this.theme.fg("border", "│") + content + " ".repeat(Math.max(0, width - visibleWidth(content))) + this.theme.fg("border", "│");
 	}
+}
+
+function fillOverlayHeight(lines: readonly string[], height: number, spacer: string): string[] {
+	const target = Math.max(1, Math.floor(height));
+	if (lines.length === target) return [...lines];
+	if (lines.length < target) {
+		const bottom = lines.at(-1) ?? spacer;
+		return [...lines.slice(0, -1), ...Array(target - lines.length).fill(spacer), bottom];
+	}
+	if (target === 1) return [lines.at(-1) ?? spacer];
+	return [...lines.slice(0, target - 1), lines.at(-1)!];
 }
 
 function selectionKey(selection: ControlCenterSelection): string {
@@ -264,7 +290,7 @@ async function editDefinition(ctx: ExtensionContext, directories: DefinitionDire
 async function showDetail(ctx: ExtensionContext, title: string, result: NodeResult | undefined, message: string): Promise<void> {
 	if (ctx.mode !== "tui") return;
 	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-		const component = new DetailComponent(theme, title, result, message);
+		const component = new DetailComponent(theme, title, result, message, () => tui.terminal.rows);
 		return {
 			render: (width) => component.render(width),
 			handleInput: (data) => { component.handleInput(data, done); tui.requestRender(); },
@@ -284,11 +310,11 @@ async function openControlCenter(ctx: ExtensionContext, runtime: SubagentRuntime
 		const action = await ctx.ui.custom<ViewAction>((tui, theme, _keybindings, done) => {
 			component = new ControlCenterComponent(theme, state, done, (apply) => {
 				void runtime.runs().then(apply).catch(() => undefined);
-			});
+			}, () => tui.terminal.rows);
 			component.startRefresh(tui);
 			return {
 				render: (width) => component!.render(width),
-				handleInput: (data) => component!.handleInput(data),
+				handleInput: (data) => { component!.handleInput(data); tui.requestRender(); },
 				invalidate: () => component!.invalidate(),
 				dispose: () => component!.dispose(),
 			};

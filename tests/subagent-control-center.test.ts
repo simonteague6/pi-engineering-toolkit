@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ControlCenterComponent } from "../extensions/subagent-control-center.ts";
 import {
 	controlCenterReducer,
 	controlCenterViewModel,
@@ -7,6 +8,7 @@ import {
 	runKey,
 	type ControlCenterState,
 } from "../extensions/subagent-control-center-model.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { StatusView } from "../subagents/runtime.ts";
 
 function runs(): StatusView[] {
@@ -20,6 +22,11 @@ function runs(): StatusView[] {
 		],
 	}];
 }
+
+const testTheme = {
+	fg: (_color: string, text: string) => text,
+	bold: (text: string) => text,
+} as unknown as Theme;
 
 describe("subagent control-center view model", () => {
 	test("derives a split-view list and dependency edges from runtime status", () => {
@@ -55,5 +62,41 @@ describe("subagent control-center view model", () => {
 		expect(state.selected).toBeUndefined();
 		state = controlCenterReducer(state, { type: "replace-runs", runs: [] });
 		expect(state.selected).toBeUndefined();
+	});
+});
+
+describe("subagent control-center component", () => {
+	test("handles navigation in place instead of closing and reopening the overlay", () => {
+		const actions: string[] = [];
+		const component = new ControlCenterComponent(
+			testTheme,
+			createControlCenterState(runs()),
+			(action) => actions.push(action.type),
+			() => undefined,
+		);
+
+		component.handleInput("j");
+
+		expect(actions).toEqual([]);
+		expect(component.getState().selected).toEqual({ kind: "node", runId: "run_1", nodeId: "research" });
+
+		component.handleInput("\r");
+		expect(actions).toEqual(["open"]);
+	});
+
+	test("fills the overlay to the terminal height", () => {
+		const component = new ControlCenterComponent(
+			testTheme,
+			createControlCenterState(),
+			() => undefined,
+			() => undefined,
+			() => 12,
+		);
+
+		const lines = component.render(40);
+
+		expect(lines).toHaveLength(12);
+		expect(lines[0]).toStartWith("╭");
+		expect(lines.at(-1)).toStartWith("╰");
 	});
 });
