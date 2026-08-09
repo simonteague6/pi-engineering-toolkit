@@ -54,7 +54,8 @@ const graphSchema = Type.Object({
 const launchSchema = Type.Object({
 	graph: graphSchema,
 	delivery: Type.Optional(StringEnum(["detached", "blocking"] as const)),
-	idleLimitMs: Type.Optional(Type.Integer({ minimum: 1 })),
+	idleLimitMs: Type.Optional(Type.Integer({ minimum: 1, description: "At least 30000ms unless allowShortIdleLimit is explicitly set for a controlled test." })),
+	allowShortIdleLimit: Type.Optional(Type.Boolean({ description: "Explicitly permit an unsafe idle limit below 30000ms for a controlled test." })),
 });
 
 const recoveryReplacementSchema = Type.Object({
@@ -83,7 +84,8 @@ const recoverSchema = Type.Object({
 	runId: Type.String({ description: "Failed source run ID." }),
 	plan: recoveryPlanSchema,
 	delivery: Type.Optional(StringEnum(["detached", "blocking"] as const)),
-	idleLimitMs: Type.Optional(Type.Integer({ minimum: 1 })),
+	idleLimitMs: Type.Optional(Type.Integer({ minimum: 1, description: "At least 30000ms unless allowShortIdleLimit is explicitly set for a controlled test." })),
+	allowShortIdleLimit: Type.Optional(Type.Boolean({ description: "Explicitly permit an unsafe idle limit below 30000ms for a controlled test." })),
 });
 
 export type SubagentTool<TParams extends TSchema = TSchema> = ToolDefinition<TParams, SubagentToolDetails>;
@@ -246,10 +248,11 @@ function tool<T extends SubagentTool>(definition: T): T {
 	return definition;
 }
 
-function launchOptions(input: { delivery?: "detached" | "blocking"; idleLimitMs?: number }): LaunchOptions {
+function launchOptions(input: { delivery?: "detached" | "blocking"; idleLimitMs?: number; allowShortIdleLimit?: boolean }): LaunchOptions {
 	return {
 		delivery: input.delivery ?? "detached",
 		...(input.idleLimitMs === undefined ? {} : { idleLimitMs: input.idleLimitMs }),
+		...(input.allowShortIdleLimit === true ? { allowShortIdleLimit: true } : {}),
 	};
 }
 

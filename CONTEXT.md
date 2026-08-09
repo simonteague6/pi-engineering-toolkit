@@ -47,7 +47,7 @@ A node's complete output written to the run store before the node is recorded as
 _Avoid_: Treating completion metadata as proof that the output was persisted.
 
 **Idle limit**:
-A configurable limit for time with no active model or tool work. An active tool call does not count as idle. V1 uses a 10-minute default with a per-run override. When the limit is reached, the run is stopped through the configured timeout policy.
+A configurable limit for time with no active model or tool work. An active tool call does not count as idle. V1 uses a 10-minute default with a per-run override; normal overrides must be at least 30 seconds. A shorter limit requires the explicit `allowShortIdleLimit` escape hatch and is reserved for controlled tests. When the limit is reached, the run is stopped through the configured timeout policy.
 _Avoid_: Wall-clock limit
 
 **Usage record**:

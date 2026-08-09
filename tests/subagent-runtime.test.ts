@@ -1086,6 +1086,11 @@ describe("subagent runtime", () => {
 
 			recovering = true;
 			const recreatedRuntime = createSubagentRuntime({ storeDirectory, runner, modelCatalog: { isAvailable: () => true } });
+			await expect(recreatedRuntime.recover(failed.run.id, {
+				replacements: [{ logicalRole: "Retry" }],
+			}, { delivery: "blocking", idleLimitMs: 1_000 })).rejects.toThrow("Run idleLimitMs of 1000ms is unsafe");
+			expect(requests).toHaveLength(3);
+
 			const recovered = await recreatedRuntime.recover(failed.run.id, {
 				replacements: [{
 					logicalRole: "Retry",
@@ -1335,7 +1340,7 @@ describe("run control", () => {
 		};
 
 		await withRuntime(runner, async (runtime) => {
-			const execution = runtime.launch(singleNode(), { delivery: "blocking", idleLimitMs: 20 });
+			const execution = runtime.launch(singleNode(), { delivery: "blocking", idleLimitMs: 20, allowShortIdleLimit: true });
 			await runnerStarted;
 			clock.advance(19);
 			await Promise.resolve();
@@ -1349,6 +1354,36 @@ describe("run control", () => {
 				error: { kind: "timeout" },
 			});
 		}, { clock });
+	});
+
+	test("rejects a one-second idle limit before starting a child unless explicitly overridden", async () => {
+		let requests = 0;
+		const runner: ChildRunner = {
+			run: async () => {
+				requests += 1;
+				return { state: "completed", output: "controlled test" };
+			},
+		};
+
+		expect(() => createSubagentRuntime({
+			runner,
+			modelCatalog: { isAvailable: () => true },
+			idleLimitMs: 1_000,
+		})).toThrow("Runtime idleLimitMs of 1000ms is unsafe");
+
+		await withRuntime(runner, async (runtime) => {
+			await expect(runtime.launch(singleNode(), { delivery: "blocking", idleLimitMs: 1_000 }))
+				.rejects.toThrow("Run idleLimitMs of 1000ms is unsafe");
+			expect(requests).toBe(0);
+
+			const result = await runtime.launch(singleNode(), {
+				delivery: "blocking",
+				idleLimitMs: 1_000,
+				allowShortIdleLimit: true,
+			});
+			expect(result.run.state).toBe("completed");
+			expect(requests).toBe(1);
+		});
 	});
 });
 

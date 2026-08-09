@@ -138,6 +138,23 @@ describe("subagent parent tools", () => {
 		expect(response.content[0]?.text.length).toBeLessThan(50_000);
 	});
 
+	test("forwards an explicit short idle-limit override", async () => {
+		const { tools, calls } = register();
+		await execute(tools.get("subagent_launch")!, {
+			graph: { kind: "single", node: { agent: "worker", logicalRole: "Test", task: "Controlled test" } },
+			idleLimitMs: 1_000,
+			allowShortIdleLimit: true,
+		});
+
+		expect(calls[0]).toEqual({
+			operation: "launch",
+			args: {
+				graph: { kind: "single", node: { agent: "worker", logicalRole: "Test", task: "Controlled test" } },
+				options: { delivery: "detached", idleLimitMs: 1_000, allowShortIdleLimit: true },
+			},
+		});
+	});
+
 	test("accepts IDs on chain nodes and lets chain position define ordering", async () => {
 		const { tools, calls } = register();
 		await execute(tools.get("subagent_launch")!, {

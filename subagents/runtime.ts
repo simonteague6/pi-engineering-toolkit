@@ -262,6 +262,8 @@ export interface LaunchOptions {
 	delivery?: "detached" | "blocking";
 	/** Time with no active provider or tool work. Defaults to ten minutes. */
 	idleLimitMs?: number;
+	/** Explicitly permits an idle limit below the safe minimum for controlled tests. */
+	allowShortIdleLimit?: boolean;
 }
 
 export interface LifecycleEvent {
@@ -330,8 +332,8 @@ export interface SubagentRuntimeOptions {
 /** Stable public operations; storage files and process details remain private. */
 export interface SubagentRuntime {
 	launch(graph: GraphDefinition): Promise<LaunchReceipt>;
-	launch(graph: GraphDefinition, options: { delivery: "blocking"; idleLimitMs?: number }): Promise<LaunchResult>;
-	launch(graph: GraphDefinition, options: { delivery: "detached"; idleLimitMs?: number }): Promise<LaunchReceipt>;
+	launch(graph: GraphDefinition, options: { delivery: "blocking"; idleLimitMs?: number; allowShortIdleLimit?: boolean }): Promise<LaunchResult>;
+	launch(graph: GraphDefinition, options: { delivery: "detached"; idleLimitMs?: number; allowShortIdleLimit?: boolean }): Promise<LaunchReceipt>;
 	launch(graph: GraphDefinition, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	status(runId: string): Promise<StatusView>;
 	/** Lists runs owned by the current parent session in stable ID order. */
@@ -343,8 +345,8 @@ export interface SubagentRuntime {
 	resume(runId: string): Promise<LaunchResult>;
 	/** Creates a new run that replaces failed roles and reuses unaffected durable work. */
 	recover(runId: string, plan: RecoveryPlan): Promise<LaunchReceipt>;
-	recover(runId: string, plan: RecoveryPlan, options: { delivery: "blocking"; idleLimitMs?: number }): Promise<LaunchResult>;
-	recover(runId: string, plan: RecoveryPlan, options: { delivery: "detached"; idleLimitMs?: number }): Promise<LaunchReceipt>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "blocking"; idleLimitMs?: number; allowShortIdleLimit?: boolean }): Promise<LaunchResult>;
+	recover(runId: string, plan: RecoveryPlan, options: { delivery: "detached"; idleLimitMs?: number; allowShortIdleLimit?: boolean }): Promise<LaunchReceipt>;
 	recover(runId: string, plan: RecoveryPlan, options: LaunchOptions): Promise<LaunchReceipt | LaunchResult>;
 	/** Gracefully suspends runtime-owned active runs. */
 	dispose(): Promise<void>;
@@ -415,7 +417,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 	const defaultIdleLimitMs = options.idleLimitMs ?? DEFAULT_IDLE_LIMIT_MS;
 	const retentionPeriodMs = options.retentionPeriodMs ?? DEFAULT_RETENTION_PERIOD_MS;
 	const terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
-	validatePositiveDuration("Runtime idleLimitMs", defaultIdleLimitMs);
+	validateIdleLimit("Runtime idleLimitMs", defaultIdleLimitMs);
 	validatePositiveDuration("Runtime retentionPeriodMs", retentionPeriodMs);
 	validatePositiveDuration("Runtime terminationGraceMs", terminationGraceMs);
 
@@ -747,7 +749,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		const graph = immutableGraphDefinition(graphDefinition);
 		if (graph.nodes.length === 0) throw new Error("Graph must contain at least one node");
 		const idleLimitMs = launchOptions?.idleLimitMs ?? defaultIdleLimitMs;
-		validatePositiveDuration("Run idleLimitMs", idleLimitMs);
+		validateIdleLimit("Run idleLimitMs", idleLimitMs, launchOptions?.allowShortIdleLimit);
 		effectiveConcurrencyLimit(options.maxConcurrency, graph.maxConcurrency);
 		const parentCwd = options.cwd ?? process.cwd();
 		const prepared = await prepareNodes(graph, parentCwd);
@@ -782,7 +784,7 @@ export function createSubagentRuntime(options: SubagentRuntimeOptions): Subagent
 		}
 		const recoveryGraph = graphWithRecoveryReplacements(graph, replacementByRole);
 		const idleLimitMs = launchOptions?.idleLimitMs ?? defaultIdleLimitMs;
-		validatePositiveDuration("Run idleLimitMs", idleLimitMs);
+		validateIdleLimit("Run idleLimitMs", idleLimitMs, launchOptions?.allowShortIdleLimit);
 		effectiveConcurrencyLimit(options.maxConcurrency, graph.maxConcurrency);
 		const prepared = await prepareNodes(recoveryGraph, options.cwd ?? process.cwd());
 		const runId = `run_${randomUUID()}`;
@@ -1031,6 +1033,13 @@ function validatePositiveDuration(label: string, value: number): void {
 	if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive safe integer`);
 }
 
+function validateIdleLimit(label: string, value: number, allowShortIdleLimit = false): void {
+	validatePositiveDuration(label, value);
+	if (value < MIN_IDLE_LIMIT_MS && !allowShortIdleLimit) {
+		throw new Error(`${label} of ${value}ms is unsafe; use at least ${MIN_IDLE_LIMIT_MS}ms or explicitly set allowShortIdleLimit for a controlled test`);
+	}
+}
+
 function isTerminal(state: LifecycleState): boolean {
 	return state === "completed" || state === "failed" || state === "cancelled";
 }
@@ -1041,6 +1050,8 @@ function immutableNodeDefinition(definition: Readonly<NodeDefinition>): Readonly
 }
 
 export const DEFAULT_MAX_CONCURRENCY = 6;
+/** Shorter limits can expire before a child model session begins. */
+export const MIN_IDLE_LIMIT_MS = 30_000;
 export const DEFAULT_IDLE_LIMIT_MS = 10 * 60 * 1000;
 export const DEFAULT_RETENTION_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_TERMINATION_GRACE_MS = 5_000;
