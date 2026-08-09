@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	defaultRuntimeOwner,
 	registerSubagentTools,
 	type SubagentTool,
 } from "../extensions/subagent-tools.ts";
@@ -77,6 +78,9 @@ function runtimeFixture(): { runtime: SubagentRuntime; calls: Array<{ operation:
 		cleanup: async () => ({ removedRunIds: [], preservedRunIds: [] }),
 		events: async () => [],
 		result: async () => result.nodes[0]!.result!,
+		notifications: async () => [],
+		acknowledgeNotifications: async () => {},
+		subscribeNotifications: () => () => {},
 	} as unknown as SubagentRuntime;
 	return { runtime, calls };
 }
@@ -175,6 +179,84 @@ describe("subagent parent tools", () => {
 		await pending;
 		expect(calls).toContainEqual({ operation: "cancel", args: { runId: "run_456", nodeId: undefined } });
 		expect(calls.filter(({ operation }) => operation === "cancel")).toHaveLength(1);
+	});
+
+	test("does not leave a graph-result notification after a blocking launch", async () => {
+		const { runtime } = runtimeFixture();
+		const notification = {
+			id: "notification_1",
+			parentSessionId: "parent",
+			runId: "run_456",
+			kind: "graph-result" as const,
+			state: "completed" as const,
+			message: "Run run_456 completed",
+			artifactPaths: ["/store/graph-result.json"],
+			createdAt: 1,
+		};
+		let queued = [notification];
+		const notifyingRuntime = {
+			...runtime,
+			notifications: async () => queued,
+			acknowledgeNotifications: async (ids: readonly string[]) => {
+				queued = queued.filter(({ id }) => !ids.includes(id));
+			},
+		} as SubagentRuntime;
+		const tools = new Map<string, SubagentTool>();
+		const pi = { registerTool: (tool: SubagentTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
+		registerSubagentTools(pi, () => notifyingRuntime);
+
+		await execute(tools.get("subagent_launch")!, {
+			graph: { kind: "single", node: { agent: "worker", logicalRole: "Implement", task: "Do work" } },
+			delivery: "blocking",
+		}, new AbortController().signal);
+
+		expect(await notifyingRuntime.notifications()).toEqual([]);
+	});
+
+	test("sends an unacknowledged parent notification at most once across concurrent flushes", async () => {
+		const notification = {
+			id: "notification_1",
+			parentSessionId: "parent",
+			runId: "run_1",
+			kind: "graph-result" as const,
+			state: "completed" as const,
+			message: "Run run_1 completed",
+			artifactPaths: ["/store/graph-result.json"],
+			createdAt: 1,
+		};
+		let queued = [notification];
+		let releaseSend!: () => void;
+		const sendBlocked = new Promise<void>((resolve) => { releaseSend = resolve; });
+		const sent: unknown[] = [];
+		const runtime = {
+			notifications: async () => queued,
+			acknowledgeNotifications: async (ids: readonly string[]) => {
+				queued = queued.filter(({ id }) => !ids.includes(id));
+			},
+			dispose: async () => {},
+		} as unknown as SubagentRuntime;
+		const pi = {
+			sendMessage: async (message: unknown) => {
+				sent.push(message);
+				await sendBlocked;
+			},
+		} as unknown as ExtensionAPI;
+		const owner = defaultRuntimeOwner(pi, () => runtime);
+		owner.bind({
+			cwd: "/repo",
+			modelRegistry: { find: () => ({}) },
+			sessionManager: { getSessionFile: () => "parent" },
+			isIdle: () => true,
+		} as any);
+		const explicitFlush = owner.flush();
+		await Promise.resolve();
+		await Promise.resolve();
+		releaseSend();
+		await explicitFlush;
+		await Promise.resolve();
+
+		expect(sent).toHaveLength(1);
+		expect(queued).toEqual([]);
 	});
 
 	test("renders active and terminal lifecycle states", () => {

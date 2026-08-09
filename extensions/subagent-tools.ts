@@ -397,7 +397,9 @@ async function launchWithParentCancellation(
 ): Promise<LaunchReceipt | LaunchResult> {
 	if (options.delivery !== "blocking" || !signal) return runtime.launch(graph, options);
 	const receipt = await runtime.launch(graph, { ...options, delivery: "detached" });
-	return withParentCancellation(signal, () => runtime.cancel(receipt.run.id), () => runtime.join(receipt.run.id));
+	const result = await withParentCancellation(signal, () => runtime.cancel(receipt.run.id), () => runtime.join(receipt.run.id));
+	await acknowledgeRunNotifications(runtime, receipt.run.id);
+	return result;
 }
 
 async function recoverWithParentCancellation(
@@ -409,7 +411,16 @@ async function recoverWithParentCancellation(
 ): Promise<LaunchReceipt | LaunchResult> {
 	if (options.delivery !== "blocking" || !signal) return runtime.recover(runId, plan, options);
 	const receipt = await runtime.recover(runId, plan, { ...options, delivery: "detached" });
-	return withParentCancellation(signal, () => runtime.cancel(receipt.run.id), () => runtime.join(receipt.run.id));
+	const result = await withParentCancellation(signal, () => runtime.cancel(receipt.run.id), () => runtime.join(receipt.run.id));
+	await acknowledgeRunNotifications(runtime, receipt.run.id);
+	return result;
+}
+
+async function acknowledgeRunNotifications(runtime: SubagentRuntime, runId: string): Promise<void> {
+	const notificationIds = (await runtime.notifications())
+		.filter((notification) => notification.runId === runId)
+		.map((notification) => notification.id);
+	await runtime.acknowledgeNotifications(notificationIds);
 }
 
 async function withParentCancellation<T>(
@@ -438,7 +449,7 @@ async function withParentCancellation<T>(
 	}
 }
 
-interface RuntimeOwner {
+export interface RuntimeOwner {
 	factory: SubagentRuntimeFactory;
 	bind: (ctx: ToolContext) => void;
 	flush: () => Promise<void>;
@@ -447,7 +458,10 @@ interface RuntimeOwner {
 
 const SUBAGENT_NOTIFICATION_TYPE = "subagent-parent-notification";
 
-function defaultRuntimeOwner(pi: ExtensionAPI): RuntimeOwner {
+export function defaultRuntimeOwner(
+	pi: ExtensionAPI,
+	runtimeCreator: typeof createSubagentRuntime = createSubagentRuntime,
+): RuntimeOwner {
 	let runtime: SubagentRuntime | undefined;
 	let context: ToolContext | undefined;
 	let flushing = false;
@@ -456,18 +470,20 @@ function defaultRuntimeOwner(pi: ExtensionAPI): RuntimeOwner {
 	const flush = async (): Promise<void> => {
 		scheduled = false;
 		if (flushing || !runtime || !context || !context.isIdle()) return;
-		const notifications = await runtime.notifications();
-		if (notifications.length === 0) return;
 		flushing = true;
 		try {
-			const content = formatParentNotifications(notifications);
-			await Promise.resolve(pi.sendMessage({
-				customType: SUBAGENT_NOTIFICATION_TYPE,
-				content,
-				display: true,
-				details: { notifications },
-			}, { triggerTurn: true, deliverAs: "followUp" }));
-			await runtime.acknowledgeNotifications(notifications.map((notification) => notification.id));
+			while (context.isIdle()) {
+				const notifications = await runtime.notifications();
+				if (notifications.length === 0) return;
+				const content = formatParentNotifications(notifications);
+				await Promise.resolve(pi.sendMessage({
+					customType: SUBAGENT_NOTIFICATION_TYPE,
+					content,
+					display: true,
+					details: { notifications },
+				}, { triggerTurn: true, deliverAs: "followUp" }));
+				await runtime.acknowledgeNotifications(notifications.map((notification) => notification.id));
+			}
 		} finally {
 			flushing = false;
 		}
@@ -484,7 +500,7 @@ function defaultRuntimeOwner(pi: ExtensionAPI): RuntimeOwner {
 			return;
 		}
 		const parentSessionId = ctx.sessionManager.getSessionFile() ?? `ephemeral:${ctx.cwd}`;
-		runtime = createSubagentRuntime({
+		runtime = runtimeCreator({
 			cwd: ctx.cwd,
 			parentSessionId,
 			modelCatalog: { isAvailable: (provider, model) => ctx.modelRegistry.find(provider, model) !== undefined },
