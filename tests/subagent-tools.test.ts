@@ -112,6 +112,17 @@ describe("subagent parent tools", () => {
 		]);
 	});
 
+	test("does not expose idle-limit overrides in the model-facing schemas", () => {
+		const { tools } = register();
+		const launchParameters = tools.get("subagent_launch")!.parameters as { properties: Record<string, unknown> };
+		const recoverParameters = tools.get("subagent_recover")!.parameters as { properties: Record<string, unknown> };
+
+		expect(launchParameters.properties).not.toHaveProperty("idleLimitMs");
+		expect(launchParameters.properties).not.toHaveProperty("allowShortIdleLimit");
+		expect(recoverParameters.properties).not.toHaveProperty("idleLimitMs");
+		expect(recoverParameters.properties).not.toHaveProperty("allowShortIdleLimit");
+	});
+
 	test("translates launch input and keeps detached output compact", async () => {
 		const { tools, calls } = register();
 		const response = await execute(tools.get("subagent_launch")!, {
@@ -138,10 +149,16 @@ describe("subagent parent tools", () => {
 		expect(response.content[0]?.text.length).toBeLessThan(50_000);
 	});
 
-	test("forwards an explicit short idle-limit override", async () => {
+	test("does not forward model-supplied idle-limit overrides to launch or recovery", async () => {
 		const { tools, calls } = register();
 		await execute(tools.get("subagent_launch")!, {
 			graph: { kind: "single", node: { agent: "worker", logicalRole: "Test", task: "Controlled test" } },
+			idleLimitMs: 1_000,
+			allowShortIdleLimit: true,
+		});
+		await execute(tools.get("subagent_recover")!, {
+			runId: "run_1",
+			plan: { replacements: [{ logicalRole: "Test" }] },
 			idleLimitMs: 1_000,
 			allowShortIdleLimit: true,
 		});
@@ -150,7 +167,15 @@ describe("subagent parent tools", () => {
 			operation: "launch",
 			args: {
 				graph: { kind: "single", node: { agent: "worker", logicalRole: "Test", task: "Controlled test" } },
-				options: { delivery: "detached", idleLimitMs: 1_000, allowShortIdleLimit: true },
+				options: { delivery: "detached" },
+			},
+		});
+		expect(calls[1]).toEqual({
+			operation: "recover",
+			args: {
+				runId: "run_1",
+				plan: { replacements: [{ logicalRole: "Test" }] },
+				options: { delivery: "detached" },
 			},
 		});
 	});

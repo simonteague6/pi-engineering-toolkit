@@ -92,11 +92,11 @@ chain:    { kind: "chain", nodes: [{ agent, logicalRole, task }, ...] }
 dag:      { kind: "dag", nodes: [{ id, agent, logicalRole, task, dependsOn }, ...] }
 ```
 
-`maxConcurrency`, `delivery` (`detached` or `blocking`), and `idleLimitMs` are optional launch controls. A DAG must use unique IDs and be acyclic. `idleLimitMs` must be at least 30 seconds; limits below that require the explicit `allowShortIdleLimit: true` escape hatch and are reserved for controlled tests.
+`maxConcurrency` and `delivery` (`detached` or `blocking`) are optional model-facing launch controls. A DAG must use unique IDs and be acyclic. Agents should rely on the runtime's ten-minute idle-watchdog default rather than setting an idle limit; use `subagent_cancel` for deliberate cancellation.
 
 #### Launch and delivery
 
-`subagent_launch` defaults to **detached** delivery: it returns a small receipt while the child continues. Use `subagent_join` when the final result is needed. Choose **blocking** delivery only when the parent turn must wait for the terminal result. Each run has a user-owned concurrency ceiling (six by default) and an idle limit (ten minutes by default); a graph can lower, but never raise, that ceiling. Normal per-run idle limits have a 30-second minimum so startup latency cannot immediately time out a child.
+`subagent_launch` defaults to **detached** delivery: it returns a small receipt while the child continues. Use `subagent_join` when the final result is needed. Choose **blocking** delivery only when the parent turn must wait for the terminal result. Each run has a user-owned concurrency ceiling (six by default) and a runtime idle watchdog (ten minutes by default); a graph can lower, but never raise, that ceiling. Runtime/API callers may configure the watchdog and per-run overrides, but model-facing tools do not expose those controls. Use `subagent_cancel` when cancellation is deliberate.
 
 A child receives its declared working directory, task text, selected definition, and fresh Pi resource discovery. It starts with no parent transcript or in-memory extension state. A completed node writes its full durable result before the runtime marks it complete. Chain and graph successors receive complete predecessor handoffs, inline when small and through an artifact path when large.
 
