@@ -4,6 +4,12 @@ import type { TSchema } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
+	defaultDefinitionDirectories,
+	formatAgentDefinitionCatalog,
+	listAgentDefinitions,
+	type DefinitionDirectories,
+} from "../subagents/definitions.ts";
+import {
 	createSubagentRuntime,
 	DEFAULT_MAX_CONCURRENCY,
 	type GraphDefinition,
@@ -536,9 +542,27 @@ function formatParentNotifications(notifications: readonly ParentNotification[])
 	return lines.join("\n");
 }
 
+export async function appendAgentDefinitionCatalog(
+	systemPrompt: string,
+	activeTools: readonly string[],
+	cwd: string,
+	directories: DefinitionDirectories = defaultDefinitionDirectories(cwd),
+): Promise<string> {
+	if (!activeTools.includes("subagent_launch")) return systemPrompt;
+	const definitions = await listAgentDefinitions(directories);
+	return `${systemPrompt}\n\n${formatAgentDefinitionCatalog(definitions)}`;
+}
+
 export default function subagentToolsExtension(pi: ExtensionAPI): void {
 	const owner = defaultRuntimeOwner(pi);
 	registerSubagentTools(pi, owner.factory);
+	pi.on("before_agent_start", async (event, ctx) => ({
+		systemPrompt: await appendAgentDefinitionCatalog(
+			event.systemPrompt,
+			event.systemPromptOptions.selectedTools ?? pi.getActiveTools(),
+			ctx.cwd,
+		),
+	}));
 	pi.on("session_start", (_event, ctx) => owner.bind(ctx));
 	pi.on("agent_settled", (_event, ctx) => { owner.bind(ctx); void owner.flush(); });
 	pi.on("session_shutdown", owner.dispose);

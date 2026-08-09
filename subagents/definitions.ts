@@ -25,6 +25,20 @@ export interface DefinitionDirectories {
 	readonly project: string;
 }
 
+/** Formats the effective definitions that a parent may select in `subagent_launch`. */
+export function formatAgentDefinitionCatalog(definitions: readonly AgentDefinition[]): string {
+	const lines = [
+		"## Subagent definitions",
+		"For `subagent_launch`, set each node's `agent` to an exact definition ID from this exhaustive list. `logicalRole` names the responsibility assigned by the parent; it does not select the child definition. Choose the definition whose role and tool allowlist fit the task. Never invent an ID: an unlisted ID, including `general`, fails at launch.",
+		"Effective definitions for this working directory resolve project > user > bundled:",
+	];
+	for (const definition of definitions) {
+		lines.push(`- \`${definition.id}\` — ${definition.description} Tools: ${definition.tools.join(", ")}. Default: ${definition.provider}/${definition.model} (${definition.reasoning}).`);
+	}
+	if (definitions.length === 0) lines.push("- No effective definitions are available; do not launch a child until definitions are configured.");
+	return lines.join("\n");
+}
+
 export interface AgentDefinitionInfo extends AgentDefinition {
 	readonly source: DefinitionSource;
 	readonly path: string;
