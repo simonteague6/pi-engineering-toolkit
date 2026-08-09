@@ -138,6 +138,33 @@ describe("subagent parent tools", () => {
 		expect(response.content[0]?.text.length).toBeLessThan(50_000);
 	});
 
+	test("accepts IDs on chain nodes and lets chain position define ordering", async () => {
+		const { tools, calls } = register();
+		await execute(tools.get("subagent_launch")!, {
+			graph: {
+				kind: "chain",
+				nodes: [
+					{ id: "list-users", agent: "recon", logicalRole: "Users", task: "List users" },
+					{ id: "list-tmp", agent: "recon", logicalRole: "Tmp", task: "List tmp" },
+				],
+			},
+		});
+
+		expect(calls[0]).toEqual({
+			operation: "launch",
+			args: {
+				graph: {
+					kind: "chain",
+					nodes: [
+						{ agent: "recon", logicalRole: "Users", task: "List users" },
+						{ agent: "recon", logicalRole: "Tmp", task: "List tmp" },
+					],
+				},
+				options: { delivery: "detached" },
+			},
+		});
+	});
+
 	test("translates and executes status, join, cancel, resume, and recovery", async () => {
 		const { tools, calls } = register();
 		await execute(tools.get("subagent_status")!, { runId: "run_1" });

@@ -35,8 +35,8 @@ const nodeSchema = Type.Object({
 	agent: Type.String({ description: "Agent definition ID." }),
 	logicalRole: Type.String({ description: "Parent-assigned responsibility for this node." }),
 	task: Type.String({ description: "Plain-text task for the child." }),
-	id: Type.Optional(Type.String({ description: "Static DAG node ID." })),
-	dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Direct predecessor node IDs." })),
+	id: Type.Optional(Type.String({ description: "Optional node ID; used only for DAG graphs and ignored otherwise." })),
+	dependsOn: Type.Optional(Type.Array(Type.String({ description: "Direct predecessor node ID." }), { description: "DAG graphs only." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this node." })),
 	provider: Type.Optional(Type.String()),
 	model: Type.Optional(Type.String()),
@@ -272,11 +272,13 @@ function toGraph(input: LaunchInput["graph"]): GraphDefinition {
 			...(input.maxConcurrency === undefined ? {} : { maxConcurrency: input.maxConcurrency }),
 		};
 	}
-	if (input.nodes.some((node) => node.id !== undefined || node.dependsOn !== undefined)) {
-		throw new Error(`${input.kind} graph nodes must not declare id or dependsOn`);
+	if (input.nodes.some((node) => node.dependsOn !== undefined)) {
+		throw new Error(`${input.kind} graph nodes must not declare dependsOn`);
 	}
 	return {
 		kind: input.kind,
+		// IDs are accepted for ergonomic compatibility with the shared node shape,
+		// but chain/parallel execution uses generated IDs and graph position.
 		nodes: input.nodes.map(toNodeDefinition),
 		...(input.maxConcurrency === undefined ? {} : { maxConcurrency: input.maxConcurrency }),
 	} as GraphDefinition;
